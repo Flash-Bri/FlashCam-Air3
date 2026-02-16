@@ -40,10 +40,15 @@ This app uses the standard Camera2 API to capture at these full resolutions. No 
 - **Exposure compensation** (EV+/EV-) with real-time preview adjustment
 - **AF/AE status indicator** showing focus and exposure state
 
-### Orientation
-- Landscape (default) and Portrait modes
-- **Pixel rotation** — saved images are physically rotated to be upright
+### Orientation & Preview Framing
+- **Landscape** (default) and **Portrait** modes with a toggle button
+- **Pixel rotation** — saved images are physically rotated to be upright:
+  - Landscape mode saves width > height
+  - Portrait mode saves height > width
 - EXIF orientation set to NORMAL after rotation for maximum compatibility
+- **Letterbox preview** — the preview shows the full captured frame without cropping
+- **Capture frame overlay** — a semi-transparent shade shows the area outside the capture frame, with an orange border marking the exact capture area
+- Overlay updates instantly when toggling between Portrait and Landscape
 
 ### Gallery Integration
 - Photos saved to `Pictures/FlashCam-Air3/` for automatic Gallery visibility
@@ -52,7 +57,7 @@ This app uses the standard Camera2 API to capture at these full resolutions. No 
 
 ### Debug/Receipt System
 - Toggle debug receipts on/off (default: off)
-- After each capture, shows: mode, orientation, requested vs actual dimensions, file path, file size
+- After each capture, shows: mode, orientation, baseRotation, pixelRotationApplied, requested vs actual dimensions, file path, file size
 - Copy receipt to clipboard or export full capture log
 
 ## Device Compatibility
@@ -82,12 +87,43 @@ This app uses the standard Camera2 API to capture at these full resolutions. No 
 git clone https://github.com/Flash-Bri/FlashCam-Air3.git
 cd FlashCam-Air3
 
-# Build (requires JDK 17 + Android SDK 34)
+# Build debug APK (no signing setup needed)
 ./gradlew assembleDebug
 
 # Install via ADB
 adb install app/build/outputs/apk/debug/app-debug.apk
 ```
+
+## Signing Setup (for Release Builds)
+
+Release builds require a signing keystore. **Never commit signing secrets to the repository.**
+
+1. Copy the example config:
+   ```bash
+   cp keystore.properties.example keystore.properties
+   ```
+
+2. Edit `keystore.properties` with your actual values:
+   ```properties
+   storeFile=release-key.jks
+   storePassword=your_actual_password
+   keyAlias=your_key_alias
+   keyPassword=your_actual_key_password
+   ```
+
+3. Generate a keystore (if you don't have one):
+   ```bash
+   keytool -genkey -v -keystore release-key.jks -keyalg RSA -keysize 2048 -validity 10000 -alias your_key_alias
+   ```
+
+4. Build the signed release APK:
+   ```bash
+   ./gradlew assembleRelease
+   ```
+
+The `keystore.properties` file and all `*.jks` / `*.keystore` files are in `.gitignore` and will never be committed. For CI/CD, set the same properties as environment variables.
+
+> **Security note:** If signing secrets were previously committed to git history, rotate your keystore and passwords immediately.
 
 ## Build Requirements
 
@@ -106,13 +142,25 @@ adb install app/build/outputs/apk/debug/app-debug.apk
 | `READ_MEDIA_IMAGES` | Gallery access (Android 13+) |
 | `READ_MEDIA_VIDEO` | Gallery access for video (Android 13+) |
 
+## Preview Framing Behavior
+
+The preview uses **letterbox scaling** (fit-inside) rather than center-crop (fill). This means:
+
+- The preview shows **exactly** what will be captured — no surprise extra content or cropping
+- Black bars (letterbox/pillarbox) may appear on the edges of the screen if the preview aspect ratio doesn't match the display
+- A **capture frame overlay** with an orange border and semi-transparent shade clearly marks the capture area
+- When switching between Portrait and Landscape modes, the overlay updates instantly to show the new framing
+- **Tap-to-focus** ignores taps in the shaded area and correctly maps taps within the capture frame to sensor coordinates
+
 ## Known Limitations
 
 1. **Max-res capture requires session switch** — switching between default and max-res modes requires closing and reopening the camera session, which causes a brief preview interruption (~0.5s)
 2. **No autofocus during max-res capture** — some devices may not support AF in max-res mode; the app falls back gracefully
 3. **DNG files are large** — ~31MB per capture at full sensor resolution
 4. **Video is always default-mode** — video recording uses the default stream map (not max-res)
-5. **Portrait mode uses pixel rotation** — this adds processing time after capture
+5. **Portrait mode uses pixel rotation** — this adds processing time after capture (~0.5–1s for 16MP)
+6. **Portrait-shaped max-res sizes** — if the HAL does not expose a portrait-oriented max-res JPEG size, the app captures in landscape and rotates pixels to produce portrait output. This is logged in the debug receipt.
+7. **INMO Air3 specific** — the app was designed for and tested on the INMO Air3. Other devices with `ULTRA_HIGH_RESOLUTION_SENSOR` may work but are untested.
 
 ## How It Works
 
@@ -134,6 +182,8 @@ This is a standard Android Camera2 API feature (added in API 31) designed for Qu
 | Images appear sideways | Update to latest version; pixel rotation should handle this |
 | DNG won't open in editor | Ensure you're using a DNG-compatible editor (Lightroom, RawTherapee, etc.) |
 | App crashes on launch | Ensure Camera permission is granted in Settings > Apps > FlashCam-Air3 |
+| Preview shows black bars | Normal — letterbox scaling shows the full capture frame; black areas are outside the capture |
+| Orange square on shutter | Update to v1.4+; this was a UI bug fixed in the shutter animation |
 
 ## License
 
@@ -141,6 +191,6 @@ MIT License — see [LICENSE](LICENSE) for details.
 
 ## Credits
 
-- Developed with assistance from [Manus AI](https://manus.im)
+- Developed with assistance from [Manus AI](https://manus.im) and [ChatGPT (OpenAI)](https://openai.com)
 - Inspired by the INMO Air3 community's discovery that the 16MP sensor was firmware-locked to 3MP
 - Camera2 max-res API documentation: [Android Developer Docs](https://developer.android.com/reference/android/hardware/camera2/CameraCharacteristics#SCALER_STREAM_CONFIGURATION_MAP_MAXIMUM_RESOLUTION)
