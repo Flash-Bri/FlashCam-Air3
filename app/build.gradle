@@ -24,7 +24,7 @@ android {
     signingConfigs {
         release {
             if (keystorePropertiesFile.exists()) {
-                storeFile file(keystoreProperties['storeFile'] ?: '../release-key.jks')
+                storeFile rootProject.file(keystoreProperties['storeFile'] ?: 'release-key.jks')
                 storePassword keystoreProperties['storePassword'] ?: System.getenv('KEYSTORE_PASSWORD') ?: ''
                 keyAlias keystoreProperties['keyAlias'] ?: System.getenv('KEY_ALIAS') ?: ''
                 keyPassword keystoreProperties['keyPassword'] ?: System.getenv('KEY_PASSWORD') ?: ''
