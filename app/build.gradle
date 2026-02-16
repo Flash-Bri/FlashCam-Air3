@@ -2,6 +2,13 @@ plugins {
     id 'com.android.application'
 }
 
+// Load signing properties from keystore.properties (not committed)
+def keystorePropertiesFile = rootProject.file("keystore.properties")
+def keystoreProperties = new Properties()
+if (keystorePropertiesFile.exists()) {
+    keystoreProperties.load(new FileInputStream(keystorePropertiesFile))
+}
+
 android {
     namespace 'com.flashcam.air3'
     compileSdk 34
@@ -10,23 +17,27 @@ android {
         applicationId "com.flashcam.air3"
         minSdk 31
         targetSdk 34
-        versionCode 1
-        versionName "1.3"
+        versionCode 6
+        versionName "1.5.1"
     }
 
     signingConfigs {
         release {
-            storeFile file("../release-key.jks")
-            storePassword "REDACTED_PASSWORD"
-            keyAlias "REDACTED_ALIAS"
-            keyPassword "REDACTED_PASSWORD"
+            if (keystorePropertiesFile.exists()) {
+                storeFile rootProject.file(keystoreProperties['storeFile'] ?: 'release-key.jks')
+                storePassword keystoreProperties['storePassword'] ?: System.getenv('KEYSTORE_PASSWORD') ?: ''
+                keyAlias keystoreProperties['keyAlias'] ?: System.getenv('KEY_ALIAS') ?: ''
+                keyPassword keystoreProperties['keyPassword'] ?: System.getenv('KEY_PASSWORD') ?: ''
+            }
         }
     }
 
     buildTypes {
         release {
             minifyEnabled false
-            signingConfig signingConfigs.release
+            if (keystorePropertiesFile.exists()) {
+                signingConfig signingConfigs.release
+            }
         }
         debug {
             minifyEnabled false

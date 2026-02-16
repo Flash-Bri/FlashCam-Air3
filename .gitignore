@@ -9,5 +9,12 @@
 .cxx
 local.properties
 /app/build
-release-key.jks
 *.apk
+
+# Signing secrets
+*.jks
+*.keystore
+*.p12
+*.pem
+*.key
+keystore.properties
