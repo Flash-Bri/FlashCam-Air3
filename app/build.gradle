@@ -17,8 +17,8 @@ android {
         applicationId "com.flashcam.air3"
         minSdk 31
         targetSdk 34
-        versionCode 5
-        versionName "1.5"
+        versionCode 6
+        versionName "1.5.1"
     }
 
     signingConfigs {

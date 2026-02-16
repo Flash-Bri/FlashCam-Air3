@@ -43,8 +43,9 @@ This app uses the standard Camera2 API to capture at these full resolutions. No 
 ### Orientation & Preview Framing
 - **Landscape** (default): saves the full sensor frame (e.g., 4608×3456 for 16MP)
 - **Portrait**: center-crops the landscape frame to **3:4 aspect ratio**, then rotates 90° CW to produce a true portrait image (height > width). No pixel data is stretched — it's a clean crop from the center of the sensor.
-- **Pixel rotation** — saved images are physically rotated to be upright. EXIF orientation is always NORMAL for maximum compatibility.
+- **Software pixel rotation** — saved images are physically rotated to be upright using `android.graphics.Matrix` rotation. `JPEG_ORIENTATION` is set to 0 (never trusted). EXIF orientation is always NORMAL for maximum compatibility.
 - **Auto-correct** — after rotation, the app verifies W>H for landscape and H>W for portrait. If mismatched, an emergency 90° correction is applied and logged.
+- **Deterministic rotation** — uses `(sensorOrientation + deviceRotation) % 360` with a single code path. No conditional branches based on camera facing direction.
 - **Capture frame overlay** — a semi-transparent shade shows the area outside the capture frame, with an orange border marking the exact capture area. In Portrait mode, the overlay shows the 3:4 crop region.
 - Overlay updates instantly when toggling between Portrait and Landscape.
 
@@ -122,7 +123,7 @@ Release builds require a signing keystore. **Never commit signing secrets to the
 
 The `keystore.properties` file and all `*.jks` / `*.keystore` files are in `.gitignore` and will never be committed. For CI/CD, set the same properties as environment variables.
 
-> **Security note:** The v1.3 release inadvertently committed hard-coded keystore passwords to git history. Those credentials have been rotated. If you forked before v1.4, rotate your signing keystore and passwords.
+> **Security note:** The v1.3 release inadvertently committed hard-coded keystore passwords to git history. Those have been **purged from all git history** using `git-filter-repo` in v1.5.1. If you cloned or forked before v1.5.1, please re-clone to get clean history. The original keystore should be considered compromised — generate a new one.
 
 ## Build Requirements
 
@@ -150,7 +151,7 @@ The preview uses **center-crop scaling** to fill the display without distortion.
 - **Tap-to-focus** only responds to taps within the clear (capture) area of the overlay
 - Focus coordinates are correctly mapped from the overlay region to sensor coordinates
 
-## Test Checklist (v1.5)
+## Test Checklist (v1.5.1)
 
 Use this checklist to verify all features after installing:
 
@@ -207,12 +208,12 @@ This approach preserves maximum image quality — no interpolation, no stretchin
 |-------|---------|
 | "Camera open failed" | Close all other camera apps, reboot the Air3, try again |
 | Max-res capture times out | Ensure no other app is using the camera; reboot |
-| Images appear sideways | Update to v1.5+; deterministic rotation with auto-correct should handle this |
+| Images appear sideways | Update to v1.5.1+; software pixel rotation with auto-correct should handle this |
 | DNG won't open in editor | Ensure you're using a DNG-compatible editor (Lightroom, RawTherapee, etc.) |
 | App crashes on launch | Ensure Camera permission is granted in Settings > Apps > FlashCam-Air3 |
 | Preview shows black bars | Normal — letterbox/pillarbox areas are outside the capture frame |
 | Orange square on shutter | Update to v1.4+; this was a UI bug fixed in the shutter animation |
-| Portrait image has wrong aspect | Update to v1.5+; portrait is now a center-crop to 3:4 |
+| Portrait image has wrong aspect | Update to v1.5.1+; portrait is now a center-crop to 3:4 |
 | "SENSOR_PIXEL_MODE not supported" | The HAL may not support this API; the app falls back to default mode |
 
 ## License
