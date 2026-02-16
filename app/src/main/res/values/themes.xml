@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.FlashCam" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+        <item name="colorPrimary">#FFFF6600</item>
+        <item name="colorPrimaryVariant">#FFCC5500</item>
+        <item name="colorOnPrimary">#FF000000</item>
+        <item name="colorSecondary">#FFFF8800</item>
+        <item name="android:windowBackground">#FF000000</item>
+        <item name="android:statusBarColor">#FF000000</item>
+        <item name="android:navigationBarColor">#FF000000</item>
+        <item name="android:windowFullscreen">true</item>
+    </style>
+</resources>

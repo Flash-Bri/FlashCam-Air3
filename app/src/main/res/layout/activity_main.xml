@@ -1,0 +1,276 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#FF000000">
+
+    <!-- Camera preview -->
+    <TextureView
+        android:id="@+id/textureView"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent" />
+
+    <!-- Capture frame overlay (darkened edges) -->
+    <View
+        android:id="@+id/captureFrameOverlay"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent" />
+
+    <!-- Focus ring -->
+    <View
+        android:id="@+id/focusRing"
+        android:layout_width="60dp"
+        android:layout_height="60dp"
+        android:background="@drawable/focus_ring"
+        android:visibility="gone" />
+
+    <!-- Top bar: status + mode + focus indicator -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:gravity="center_vertical"
+        android:padding="6dp"
+        android:background="#99000000">
+
+        <TextView
+            android:id="@+id/tvStatus"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="Initializing..."
+            android:textColor="#FFFF6600"
+            android:textSize="11sp"
+            android:singleLine="true"
+            android:ellipsize="end" />
+
+        <TextView
+            android:id="@+id/tvMode"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="16 MP LAND"
+            android:textColor="#FFFFFFFF"
+            android:textSize="12sp"
+            android:paddingStart="8dp"
+            android:paddingEnd="8dp" />
+
+        <TextView
+            android:id="@+id/tvFocusIndicator"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="AF:-- | AE:--"
+            android:textColor="#FFFFAA00"
+            android:textSize="11sp"
+            android:paddingStart="8dp" />
+    </LinearLayout>
+
+    <!-- Recording indicator (top center) -->
+    <LinearLayout
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top|center_horizontal"
+        android:layout_marginTop="36dp"
+        android:orientation="horizontal"
+        android:gravity="center_vertical"
+        android:background="#99000000"
+        android:padding="4dp">
+
+        <TextView
+            android:id="@+id/tvRecTimer"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="● REC"
+            android:textColor="#FFFF0000"
+            android:textSize="14sp"
+            android:visibility="gone" />
+
+        <Chronometer
+            android:id="@+id/chronoRec"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:textColor="#FFFFFFFF"
+            android:textSize="14sp"
+            android:paddingStart="6dp"
+            android:visibility="gone" />
+    </LinearLayout>
+
+    <!-- Left controls: EV, Orientation, Debug -->
+    <LinearLayout
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="start|center_vertical"
+        android:orientation="vertical"
+        android:padding="8dp">
+
+        <Button
+            android:id="@+id/btnEvPlus"
+            android:layout_width="48dp"
+            android:layout_height="40dp"
+            android:text="EV+"
+            android:textColor="#FFFFFFFF"
+            android:textSize="10sp"
+            android:backgroundTint="#FF333333"
+            android:layout_marginBottom="4dp" />
+
+        <TextView
+            android:id="@+id/tvEv"
+            android:layout_width="48dp"
+            android:layout_height="wrap_content"
+            android:text="+0 EV"
+            android:textColor="#FFFFAA00"
+            android:textSize="10sp"
+            android:gravity="center"
+            android:layout_marginBottom="4dp" />
+
+        <Button
+            android:id="@+id/btnEvMinus"
+            android:layout_width="48dp"
+            android:layout_height="40dp"
+            android:text="EV-"
+            android:textColor="#FFFFFFFF"
+            android:textSize="10sp"
+            android:backgroundTint="#FF333333"
+            android:layout_marginBottom="12dp" />
+
+        <Button
+            android:id="@+id/btnOrientation"
+            android:layout_width="48dp"
+            android:layout_height="40dp"
+            android:text="LAND"
+            android:textColor="#FFFFFFFF"
+            android:textSize="9sp"
+            android:backgroundTint="#FF333333"
+            android:layout_marginBottom="4dp" />
+
+        <Button
+            android:id="@+id/btnDebug"
+            android:layout_width="48dp"
+            android:layout_height="40dp"
+            android:text="DBG:OFF"
+            android:textColor="#FFFFFFFF"
+            android:textSize="8sp"
+            android:backgroundTint="#FF222222" />
+    </LinearLayout>
+
+    <!-- Right controls: MP mode, DNG, Video, Shutter -->
+    <LinearLayout
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="end|center_vertical"
+        android:orientation="vertical"
+        android:gravity="center_horizontal"
+        android:padding="8dp">
+
+        <Button
+            android:id="@+id/btnMode"
+            android:layout_width="56dp"
+            android:layout_height="40dp"
+            android:text="16 MP"
+            android:textColor="#FF000000"
+            android:textSize="10sp"
+            android:backgroundTint="#FFFF6600"
+            android:layout_marginBottom="4dp" />
+
+        <Button
+            android:id="@+id/btnDng"
+            android:layout_width="56dp"
+            android:layout_height="40dp"
+            android:text="DNG:OFF"
+            android:textColor="#FFFFFFFF"
+            android:textSize="9sp"
+            android:backgroundTint="#FF333333"
+            android:layout_marginBottom="4dp" />
+
+        <Button
+            android:id="@+id/btnVideo"
+            android:layout_width="56dp"
+            android:layout_height="40dp"
+            android:text="PHOTO"
+            android:textColor="#FFFFFFFF"
+            android:textSize="9sp"
+            android:backgroundTint="#FF333333"
+            android:layout_marginBottom="12dp" />
+
+        <FrameLayout
+            android:id="@+id/shutterContainer"
+            android:layout_width="72dp"
+            android:layout_height="72dp"
+            android:layout_gravity="center">
+
+            <ImageButton
+                android:id="@+id/btnShutter"
+                android:layout_width="64dp"
+                android:layout_height="64dp"
+                android:layout_gravity="center"
+                android:background="@drawable/shutter_button"
+                android:contentDescription="Capture"
+                android:enabled="false" />
+        </FrameLayout>
+    </LinearLayout>
+
+    <!-- Receipt panel (bottom overlay, hidden by default) -->
+    <LinearLayout
+        android:id="@+id/receiptPanel"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom"
+        android:orientation="vertical"
+        android:background="#DD000000"
+        android:padding="10dp"
+        android:visibility="gone">
+
+        <ScrollView
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1"
+            android:maxHeight="200dp">
+
+            <TextView
+                android:id="@+id/tvReceipt"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text=""
+                android:textColor="#FFFFAA00"
+                android:textSize="10sp"
+                android:fontFamily="monospace" />
+        </ScrollView>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center"
+            android:layout_marginTop="6dp">
+
+            <Button
+                android:id="@+id/btnCopyReceipt"
+                android:layout_width="wrap_content"
+                android:layout_height="36dp"
+                android:text="COPY"
+                android:textSize="10sp"
+                android:textColor="#FF000000"
+                android:backgroundTint="#FFFF6600"
+                android:layout_marginEnd="8dp" />
+
+            <Button
+                android:id="@+id/btnExportLog"
+                android:layout_width="wrap_content"
+                android:layout_height="36dp"
+                android:text="EXPORT LOG"
+                android:textSize="10sp"
+                android:textColor="#FFFFFFFF"
+                android:backgroundTint="#FF333333"
+                android:layout_marginEnd="8dp" />
+
+            <Button
+                android:id="@+id/btnDismiss"
+                android:layout_width="wrap_content"
+                android:layout_height="36dp"
+                android:text="DISMISS"
+                android:textSize="10sp"
+                android:textColor="#FFFFFFFF"
+                android:backgroundTint="#FF333333" />
+        </LinearLayout>
+    </LinearLayout>
+
+</FrameLayout>

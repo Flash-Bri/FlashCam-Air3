@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Glasses frame - left lens -->
+    <path
+        android:fillColor="#FFFF6600"
+        android:pathData="M24,50 C24,42 28,38 36,38 L44,38 C48,38 50,40 50,44 L50,56 C50,60 48,62 44,62 L36,62 C28,62 24,58 24,50 Z" />
+
+    <!-- Glasses frame - right lens -->
+    <path
+        android:fillColor="#FFFF6600"
+        android:pathData="M58,50 C58,42 62,38 70,38 L78,38 C82,38 84,40 84,44 L84,56 C84,60 82,62 78,62 L70,62 C62,62 58,58 58,50 Z" />
+
+    <!-- Bridge -->
+    <path
+        android:strokeColor="#FFFF6600"
+        android:strokeWidth="3"
+        android:fillColor="#00000000"
+        android:pathData="M50,48 L58,48" />
+
+    <!-- Temple arms -->
+    <path
+        android:strokeColor="#FFFF6600"
+        android:strokeWidth="2.5"
+        android:fillColor="#00000000"
+        android:pathData="M24,44 L16,40" />
+    <path
+        android:strokeColor="#FFFF6600"
+        android:strokeWidth="2.5"
+        android:fillColor="#00000000"
+        android:pathData="M84,44 L92,40" />
+
+    <!-- Camera lens circle on right lens -->
+    <path
+        android:fillColor="#FF000000"
+        android:pathData="M71,50 m-7,0 a7,7 0 1,1 14,0 a7,7 0 1,1 -14,0" />
+    <path
+        android:fillColor="#FFFF6600"
+        android:pathData="M71,50 m-4,0 a4,4 0 1,1 8,0 a4,4 0 1,1 -8,0" />
+
+    <!-- Flash burst from bridge - 4 rays -->
+    <path
+        android:strokeColor="#FFFFAA00"
+        android:strokeWidth="2"
+        android:fillColor="#00000000"
+        android:pathData="M54,48 L54,32" />
+    <path
+        android:strokeColor="#FFFFAA00"
+        android:strokeWidth="2"
+        android:fillColor="#00000000"
+        android:pathData="M54,48 L44,34" />
+    <path
+        android:strokeColor="#FFFFAA00"
+        android:strokeWidth="2"
+        android:fillColor="#00000000"
+        android:pathData="M54,48 L64,34" />
+    <path
+        android:strokeColor="#FFFFAA00"
+        android:strokeWidth="1.5"
+        android:fillColor="#00000000"
+        android:pathData="M54,48 L48,36" />
+    <path
+        android:strokeColor="#FFFFAA00"
+        android:strokeWidth="1.5"
+        android:fillColor="#00000000"
+        android:pathData="M54,48 L60,36" />
+
+</vector>
