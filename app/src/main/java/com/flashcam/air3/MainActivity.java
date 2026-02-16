@@ -1,20 +1,15 @@
 package com.flashcam.air3;
 
 import android.Manifest;
-import android.animation.ArgbEvaluator;
-import android.animation.ValueAnimator;
 import android.content.ClipData;
 import android.content.ClipboardManager;
-import android.content.ContentValues;
 import android.content.Context;
 import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
-import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.ImageFormat;
 import android.graphics.Matrix;
-import android.graphics.Paint;
 import android.graphics.Rect;
 import android.graphics.RectF;
 import android.graphics.SurfaceTexture;
@@ -78,17 +73,19 @@ import java.util.Locale;
 import java.util.concurrent.Executor;
 
 /**
- * FlashCam-Air3 v1.3
+ * FlashCam-Air3 v1.4
  *
  * Full-featured camera for INMO Air3 glasses.
  * - 8MP / 12MP / 16MP still capture (max-res via SENSOR_PIXEL_MODE)
  * - DNG toggle (proper DngCreator output)
- * - Pixel-rotated orientation (output is always upright)
- * - Preview framing overlay showing exact capture crop
+ * - Correct orientation with pixel rotation for landscape and portrait
+ * - Letterboxed preview with capture-frame overlay
  * - Tap-to-focus + EV compensation
  * - Video: 1080p30 / 4K30
  * - Gallery integration via MediaStore
  * - Orange + Black branding
+ *
+ * Developed with assistance from Manus AI and ChatGPT (OpenAI)
  */
 public class MainActivity extends AppCompatActivity {
 
@@ -103,17 +100,18 @@ public class MainActivity extends AppCompatActivity {
 
     // ── UI ──
     private TextureView textureView;
-    private View captureFrameOverlay;
+    private CaptureFrameOverlayView captureFrameOverlay;
     private View focusRing;
     private TextView tvStatus, tvMode, tvReceipt, tvEv, tvFocusIndicator;
     private TextView tvRecTimer;
-    private Button btnMode, btnDng, btnOrientation, btnVideo, btnDebug;
+    private Button btnMode, btnDng, btnOrientation, btnVideo, btnDebug, btnCredits;
     private Button btnEvMinus, btnEvPlus;
     private ImageButton btnShutter;
     private LinearLayout receiptPanel;
     private Button btnCopyReceipt, btnExportLog, btnDismiss;
     private Chronometer chronoRec;
     private FrameLayout shutterContainer;
+    private View shutterFlashOverlay;
 
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
 
@@ -176,6 +174,14 @@ public class MainActivity extends AppCompatActivity {
     // ── Video sizes ──
     private boolean has4K = false;
 
+    // ── Status state machine (fix flicker) ──
+    private enum CamState { INITIALIZING, OPENING, READY, CAPTURING, RECORDING, ERROR }
+    private volatile CamState camState = CamState.INITIALIZING;
+    private volatile long lastStatusChangeMs = 0;
+    private static final long STATUS_THROTTLE_MS = 300;
+
+    // CaptureFrameOverlayView is now a standalone class (CaptureFrameOverlayView.java)
+
     // ================================================================
     // LIFECYCLE
     // ================================================================
@@ -183,6 +189,7 @@ public class MainActivity extends AppCompatActivity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
+        getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
 
         bindViews();
         setupListeners();
@@ -216,6 +223,7 @@ public class MainActivity extends AppCompatActivity {
         btnOrientation = findViewById(R.id.btnOrientation);
         btnVideo = findViewById(R.id.btnVideo);
         btnDebug = findViewById(R.id.btnDebug);
+        btnCredits = findViewById(R.id.btnCredits);
         btnEvMinus = findViewById(R.id.btnEvMinus);
         btnEvPlus = findViewById(R.id.btnEvPlus);
         btnShutter = findViewById(R.id.btnShutter);
@@ -225,6 +233,7 @@ public class MainActivity extends AppCompatActivity {
         btnDismiss = findViewById(R.id.btnDismiss);
         chronoRec = findViewById(R.id.chronoRec);
         shutterContainer = findViewById(R.id.shutterContainer);
+        shutterFlashOverlay = findViewById(R.id.shutterFlashOverlay);
     }
 
     private void setupListeners() {
@@ -235,6 +244,7 @@ public class MainActivity extends AppCompatActivity {
         btnOrientation.setOnClickListener(v -> toggleOrientation());
         btnVideo.setOnClickListener(v -> cycleVideoMode());
         btnDebug.setOnClickListener(v -> toggleDebug());
+        btnCredits.setOnClickListener(v -> showCredits());
         btnEvMinus.setOnClickListener(v -> adjustEv(-1));
         btnEvPlus.setOnClickListener(v -> adjustEv(+1));
         btnCopyReceipt.setOnClickListener(v -> copyReceipt());
@@ -243,13 +253,32 @@ public class MainActivity extends AppCompatActivity {
 
         textureView.setOnTouchListener((v, event) -> {
             if (event.getAction() == MotionEvent.ACTION_DOWN && !isRecording) {
-                handleTapToFocus(event.getX(), event.getY());
+                float tx = event.getX(), ty = event.getY();
+                // If overlay is showing, ignore taps outside the clear rect
+                if (captureFrameOverlay != null && !captureFrameOverlay.isInsideClearRect(tx, ty)) {
+                    return false;
+                }
+                handleTapToFocus(tx, ty);
                 return true;
             }
             return false;
         });
 
         updateAllUI();
+    }
+
+    private void showCredits() {
+        new android.app.AlertDialog.Builder(this)
+            .setTitle("FlashCam-Air3 Credits")
+            .setMessage("FlashCam-Air3 v1.4\n\n"
+                + "Developed with assistance from Manus AI and ChatGPT (OpenAI)\n\n"
+                + "Unlocks the full 16MP camera on INMO Air3 AR glasses "
+                + "using the standard Android Camera2 API.\n\n"
+                + "No root required.\n\n"
+                + "https://manus.im\nhttps://openai.com\n\n"
+                + "License: MIT")
+            .setPositiveButton("OK", null)
+            .show();
     }
 
     private void requestPermissions() {
@@ -281,7 +310,7 @@ public class MainActivity extends AppCompatActivity {
                     cameraGranted = true;
             }
             if (cameraGranted) initCamera();
-            else setStatus("Camera permission denied");
+            else setStatusForced("Camera permission denied");
         }
     }
 
@@ -379,7 +408,7 @@ public class MainActivity extends AppCompatActivity {
                 break;
             }
 
-            if (cameraId == null) { setStatus("No camera found"); return; }
+            if (cameraId == null) { setStatusForced("No camera found"); return; }
 
             cameraManager.registerAvailabilityCallback(new CameraManager.AvailabilityCallback() {
                 @Override public void onCameraAvailable(@NonNull String id) {
@@ -391,7 +420,7 @@ public class MainActivity extends AppCompatActivity {
             }, camHandler);
 
             updateAllUI();
-            setStatus("Ready | Sensor:" + sensorOrientation + "°"
+            setStatusForced("Ready | Sensor:" + sensorOrientation + "\u00B0"
                 + " | Max:" + fmtSize(maxResJpegSize)
                 + (hasRaw ? " | RAW:" + fmtSize(maxResRawSize) : "")
                 + (has4K ? " | 4K" : ""));
@@ -399,7 +428,7 @@ public class MainActivity extends AppCompatActivity {
             if (textureView.isAvailable()) workerHandler.post(this::openCamera);
 
         } catch (Exception e) {
-            setStatus("Init error: " + e.getMessage());
+            setStatusForced("Init error: " + e.getMessage());
         }
     }
 
@@ -411,7 +440,7 @@ public class MainActivity extends AppCompatActivity {
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
                 != PackageManager.PERMISSION_GRANTED) return;
 
-        setStatus("Opening camera...");
+        transitionState(CamState.OPENING);
         long t0 = System.currentTimeMillis();
         while (!cameraAvailable && System.currentTimeMillis() - t0 < 5000) {
             try { Thread.sleep(100); } catch (InterruptedException ignored) {}
@@ -430,14 +459,14 @@ public class MainActivity extends AppCompatActivity {
                 @Override public void onDisconnected(@NonNull CameraDevice camera) {
                     camera.close(); cameraDevice = null;
                     synchronized (lock) { result[0] = -1; lock.notifyAll(); }
-                    setStatus("Camera disconnected");
+                    transitionState(CamState.ERROR);
                     mainHandler.post(() -> btnShutter.setEnabled(false));
                     workerHandler.postDelayed(() -> openCamera(), 2000);
                 }
                 @Override public void onError(@NonNull CameraDevice camera, int error) {
                     camera.close(); cameraDevice = null;
                     synchronized (lock) { result[0] = error; lock.notifyAll(); }
-                    setStatus("Camera error: " + error);
+                    transitionState(CamState.ERROR);
                     mainHandler.post(() -> btnShutter.setEnabled(false));
                     workerHandler.postDelayed(() -> openCamera(), 3000);
                 }
@@ -450,10 +479,10 @@ public class MainActivity extends AppCompatActivity {
             if (result[0] == 0 && cameraDevice != null) {
                 startPreview();
             } else {
-                setStatus("Camera open failed (code " + result[0] + ")");
+                transitionState(CamState.ERROR);
             }
         } catch (Exception e) {
-            setStatus("Open error: " + e.getMessage());
+            transitionState(CamState.ERROR);
         }
     }
 
@@ -464,6 +493,37 @@ public class MainActivity extends AppCompatActivity {
         catch (Exception ignored) {}
         previewRequestBuilder = null;
         mainHandler.post(() -> btnShutter.setEnabled(false));
+    }
+
+    // ================================================================
+    // STATUS STATE MACHINE (fixes flicker)
+    // ================================================================
+    private void transitionState(CamState newState) {
+        if (newState == camState) return; // no-op if same state
+        long now = System.currentTimeMillis();
+        if (now - lastStatusChangeMs < STATUS_THROTTLE_MS && newState != CamState.ERROR
+                && newState != CamState.CAPTURING && newState != CamState.RECORDING) {
+            return; // throttle rapid transitions
+        }
+        camState = newState;
+        lastStatusChangeMs = now;
+        String msg;
+        switch (newState) {
+            case INITIALIZING: msg = "Initializing..."; break;
+            case OPENING:      msg = "Opening camera..."; break;
+            case READY:        msg = "Ready"; break;
+            case CAPTURING:    msg = "Hold still..."; break;
+            case RECORDING:    msg = "REC"; break;
+            case ERROR:        msg = "Camera error"; break;
+            default:           msg = ""; break;
+        }
+        mainHandler.post(() -> tvStatus.setText(msg));
+    }
+
+    /** Force a status update regardless of throttle (for info messages) */
+    private void setStatusForced(String msg) {
+        lastStatusChangeMs = 0;
+        mainHandler.post(() -> tvStatus.setText(msg));
     }
 
     // ================================================================
@@ -504,18 +564,20 @@ public class MainActivity extends AppCompatActivity {
                         try {
                             session.setRepeatingRequest(previewRequestBuilder.build(),
                                 previewCaptureCallback, camHandler);
-                            setStatus("Ready");
+                            transitionState(CamState.READY);
                             mainHandler.post(() -> btnShutter.setEnabled(true));
-                        } catch (Exception e) { setStatus("Preview error: " + e.getMessage()); }
+                        } catch (Exception e) {
+                            setStatusForced("Preview error: " + e.getMessage());
+                        }
                     }
                     @Override public void onConfigureFailed(@NonNull CameraCaptureSession session) {
-                        setStatus("Preview session failed");
+                        transitionState(CamState.ERROR);
                     }
                 });
 
             cameraDevice.createCaptureSession(sessConfig);
         } catch (Exception e) {
-            setStatus("Preview error: " + e.getMessage());
+            setStatusForced("Preview error: " + e.getMessage());
         }
     }
 
@@ -556,7 +618,7 @@ public class MainActivity extends AppCompatActivity {
     }
 
     // ================================================================
-    // PREVIEW TRANSFORM (center-crop, aspect-ratio preserving)
+    // PREVIEW TRANSFORM — LETTERBOX (FIT, not CROP)
     // ================================================================
     private void configurePreviewTransform() {
         if (previewSize == null || textureView == null) return;
@@ -566,28 +628,69 @@ public class MainActivity extends AppCompatActivity {
         int previewW = previewSize.getWidth(), previewH = previewSize.getHeight();
         Matrix matrix = new Matrix();
         float centerX = viewW / 2f, centerY = viewH / 2f;
+
+        // FIT: scale = MIN so the entire preview is visible (letterboxed)
         float scaleX = (float) viewW / previewW;
         float scaleY = (float) viewH / previewH;
-        float scale = Math.max(scaleX, scaleY);
+        float scale = Math.min(scaleX, scaleY);
         matrix.setScale(scale, scale, centerX, centerY);
         textureView.setTransform(matrix);
     }
 
     // ================================================================
-    // CAPTURE FRAME OVERLAY
+    // CAPTURE FRAME OVERLAY (shows exact capture area)
     // ================================================================
     private void updateCaptureFrameOverlay() {
-        if (captureFrameOverlay == null) return;
-        captureFrameOverlay.invalidate();
-        // The overlay is a custom-drawn view; we use a simple approach:
-        // set the overlay to match_parent and draw the shaded region in onDraw.
-        // Since we can't easily subclass View from XML, we'll handle this differently.
-        // For now, the overlay is informational via the status text.
-        // A proper implementation would use a custom View.
+        if (captureFrameOverlay == null || textureView == null) return;
+        if (previewSize == null) return;
+
+        int viewW = textureView.getWidth(), viewH = textureView.getHeight();
+        if (viewW == 0 || viewH == 0) return;
+
+        // The preview is letterboxed (FIT). Compute the visible preview area.
+        int previewW = previewSize.getWidth(), previewH = previewSize.getHeight();
+        float scaleX = (float) viewW / previewW;
+        float scaleY = (float) viewH / previewH;
+        float scale = Math.min(scaleX, scaleY);
+
+        float renderedW = previewW * scale;
+        float renderedH = previewH * scale;
+        float offsetX = (viewW - renderedW) / 2f;
+        float offsetY = (viewH - renderedH) / 2f;
+
+        // The capture area within the preview depends on orientation mode.
+        // Preview is always 4:3 landscape. Capture is:
+        //   LANDSCAPE: full preview area (4:3 landscape)
+        //   PORTRAIT:  a 3:4 portrait crop from the center of the preview
+        RectF clearRect;
+        if (currentOrient == OrientMode.PORTRAIT) {
+            // Portrait: 3:4 aspect within the 4:3 preview
+            float captureAspect = 3f / 4f; // width/height for portrait
+            float previewAspect = renderedW / renderedH;
+            float cropW, cropH;
+            if (captureAspect < previewAspect) {
+                // Height-limited
+                cropH = renderedH;
+                cropW = cropH * captureAspect;
+            } else {
+                // Width-limited
+                cropW = renderedW;
+                cropH = cropW / captureAspect;
+            }
+            float cx = viewW / 2f, cy = viewH / 2f;
+            clearRect = new RectF(cx - cropW / 2f, cy - cropH / 2f,
+                                   cx + cropW / 2f, cy + cropH / 2f);
+        } else {
+            // Landscape: full preview area
+            clearRect = new RectF(offsetX, offsetY,
+                                   offsetX + renderedW, offsetY + renderedH);
+        }
+
+        captureFrameOverlay.setClearRect(clearRect);
     }
 
     // ================================================================
-    // TAP-TO-FOCUS
+    // TAP-TO-FOCUS (with letterbox coordinate mapping)
     // ================================================================
     private void handleTapToFocus(float touchX, float touchY) {
         if (previewSession == null || previewRequestBuilder == null || cameraDevice == null) return;
@@ -596,7 +699,22 @@ public class MainActivity extends AppCompatActivity {
         int viewW = textureView.getWidth(), viewH = textureView.getHeight();
         if (viewW == 0 || viewH == 0) return;
 
-        float normX = touchX / viewW, normY = touchY / viewH;
+        // Map touch coordinates to sensor coordinates, accounting for letterbox
+        int previewW = previewSize.getWidth(), previewH = previewSize.getHeight();
+        float scaleX = (float) viewW / previewW;
+        float scaleY = (float) viewH / previewH;
+        float scale = Math.min(scaleX, scaleY);
+        float renderedW = previewW * scale;
+        float renderedH = previewH * scale;
+        float offsetX = (viewW - renderedW) / 2f;
+        float offsetY = (viewH - renderedH) / 2f;
+
+        // Normalize within the rendered preview area
+        float normX = (touchX - offsetX) / renderedW;
+        float normY = (touchY - offsetY) / renderedH;
+        normX = Math.max(0f, Math.min(1f, normX));
+        normY = Math.max(0f, Math.min(1f, normY));
+
         int sW = sensorArraySize.width(), sH = sensorArraySize.height();
         int regionW = (int)(sW * 0.1f), regionH = (int)(sH * 0.1f);
         int cx = (int)(normX * sW), cy = (int)(normY * sH);
@@ -623,7 +741,7 @@ public class MainActivity extends AppCompatActivity {
                 CaptureRequest.CONTROL_AF_TRIGGER_IDLE);
             previewSession.setRepeatingRequest(previewRequestBuilder.build(),
                 previewCaptureCallback, camHandler);
-        } catch (Exception e) { setStatus("Focus error: " + e.getMessage()); }
+        } catch (Exception e) { setStatusForced("Focus error: " + e.getMessage()); }
     }
 
     private void showFocusRing(float x, float y) {
@@ -684,6 +802,7 @@ public class MainActivity extends AppCompatActivity {
         currentOrient = (currentOrient == OrientMode.LANDSCAPE) ?
             OrientMode.PORTRAIT : OrientMode.LANDSCAPE;
         updateAllUI();
+        mainHandler.post(this::updateCaptureFrameOverlay);
     }
 
     private void cycleVideoMode() {
@@ -730,7 +849,7 @@ public class MainActivity extends AppCompatActivity {
             }
             btnVideo.setText(vidLabel);
 
-            // Shutter appearance
+            // Shutter appearance — always set the drawable, never change container bg
             if (currentVideo != VideoMode.OFF) {
                 btnShutter.setBackground(getDrawable(R.drawable.record_button));
             } else {
@@ -747,7 +866,6 @@ public class MainActivity extends AppCompatActivity {
 
             // Recording timer
             if (!isRecording) {
-                if (tvRecTimer != null) tvRecTimer.setVisibility(View.GONE);
                 if (chronoRec != null) chronoRec.setVisibility(View.GONE);
             }
         });
@@ -760,11 +878,13 @@ public class MainActivity extends AppCompatActivity {
         new TextureView.SurfaceTextureListener() {
             @Override public void onSurfaceTextureAvailable(@NonNull SurfaceTexture st, int w, int h) {
                 configurePreviewTransform();
+                updateCaptureFrameOverlay();
                 if (cameraId != null && cameraDevice == null)
                     workerHandler.post(() -> openCamera());
             }
             @Override public void onSurfaceTextureSizeChanged(@NonNull SurfaceTexture st, int w, int h) {
                 configurePreviewTransform();
+                updateCaptureFrameOverlay();
             }
             @Override public boolean onSurfaceTextureDestroyed(@NonNull SurfaceTexture st) { return true; }
             @Override public void onSurfaceTextureUpdated(@NonNull SurfaceTexture st) {}
@@ -775,12 +895,7 @@ public class MainActivity extends AppCompatActivity {
     // ================================================================
     private void onShutterPress() {
         if (currentVideo != VideoMode.OFF) {
-            // Video mode
-            if (isRecording) {
-                stopRecording();
-            } else {
-                startRecording();
-            }
+            if (isRecording) { stopRecording(); } else { startRecording(); }
             return;
         }
 
@@ -789,9 +904,9 @@ public class MainActivity extends AppCompatActivity {
         capturing = true;
         btnShutter.setEnabled(false);
 
-        // Shutter flash animation
+        // Shutter flash animation — on the dedicated overlay, not the container
         flashShutter();
-        setStatus("Hold still...");
+        transitionState(CamState.CAPTURING);
 
         workerHandler.post(() -> {
             try {
@@ -818,21 +933,31 @@ public class MainActivity extends AppCompatActivity {
         });
     }
 
+    /**
+     * Flash animation using a dedicated overlay view.
+     * The overlay briefly goes white then fades to transparent.
+     * The shutter button and container background are NEVER changed.
+     */
     private void flashShutter() {
         mainHandler.post(() -> {
-            if (shutterContainer != null) {
-                ValueAnimator anim = ValueAnimator.ofObject(new ArgbEvaluator(),
-                    COLOR_ORANGE, Color.WHITE, COLOR_ORANGE);
-                anim.setDuration(300);
-                anim.addUpdateListener(a ->
-                    shutterContainer.setBackgroundColor((int) a.getAnimatedValue()));
-                anim.start();
+            if (shutterFlashOverlay != null) {
+                shutterFlashOverlay.setBackgroundColor(Color.WHITE);
+                shutterFlashOverlay.setAlpha(0.7f);
+                shutterFlashOverlay.setVisibility(View.VISIBLE);
+                shutterFlashOverlay.animate()
+                    .alpha(0f)
+                    .setDuration(300)
+                    .withEndAction(() -> {
+                        shutterFlashOverlay.setVisibility(View.GONE);
+                        shutterFlashOverlay.setBackgroundColor(Color.TRANSPARENT);
+                    })
+                    .start();
             }
         });
     }
 
     // ================================================================
-    // SIZE SELECTION
+    // SIZE SELECTION — orientation-aware
     // ================================================================
     private Size getTargetJpegSize() {
         long targetPixels;
@@ -853,7 +978,6 @@ public class MainActivity extends AppCompatActivity {
         // If default map doesn't have a good match, try max-res map
         if (best != null) {
             long bestPx = (long) best.getWidth() * best.getHeight();
-            // If default map's best is much smaller than target, check max-res
             if (bestPx < targetPixels * 0.5 && maxResJpegSizes != null) {
                 Size mrBest = findClosestSize(maxResJpegSizes, targetPixels);
                 if (mrBest != null) return mrBest;
@@ -873,13 +997,12 @@ public class MainActivity extends AppCompatActivity {
     private boolean needsMaxRes() {
         Size target = getTargetJpegSize();
         if (target == null) return false;
-        // If the target size is in the max-res map but not in the default map, we need max-res
         if (defaultJpegSizes != null) {
             for (Size s : defaultJpegSizes) {
-                if (s.equals(target)) return false; // Available in default map
+                if (s.equals(target)) return false;
             }
         }
-        return true; // Must be from max-res map
+        return true;
     }
 
     private Size findClosestSize(Size[] sizes, long targetPixels) {
@@ -895,21 +1018,26 @@ public class MainActivity extends AppCompatActivity {
     }
 
     // ================================================================
-    // ORIENTATION
+    // ORIENTATION — correct computation
     // ================================================================
-    private int getJpegOrientation() {
+    /**
+     * Compute the base JPEG orientation (how many degrees CW to rotate
+     * the sensor image so it appears upright on the device display).
+     */
+    private int getBaseRotation() {
         int deviceRotation = 0;
         try {
             int displayRotation = getWindowManager().getDefaultDisplay().getRotation();
             int[] degreesMap = {0, 90, 180, 270};
             deviceRotation = degreesMap[displayRotation];
         } catch (Exception ignored) {}
+        // For a back-facing camera:
         return (sensorOrientation - deviceRotation + 360) % 360;
     }
 
     /**
      * Rotate a JPEG byte array by the given degrees (pixel rotation).
-     * Returns the rotated JPEG bytes, or null on failure.
+     * Returns the rotated JPEG bytes, or original on failure.
      */
     private byte[] rotateJpegPixels(byte[] jpegData, int degrees) {
         if (degrees == 0) return jpegData;
@@ -936,10 +1064,18 @@ public class MainActivity extends AppCompatActivity {
     }
 
     /**
-     * For portrait mode: additionally rotate 90° CW from landscape.
+     * Compute the total pixel rotation to apply.
+     *
+     * LANDSCAPE mode: rotate by baseRotation so the image is upright landscape.
+     * PORTRAIT mode:  rotate by (baseRotation + 90) so the image is upright portrait
+     *                 (height > width).
      */
-    private int getPortraitExtraRotation() {
-        return (currentOrient == OrientMode.PORTRAIT) ? 90 : 0;
+    private int getTotalPixelRotation() {
+        int base = getBaseRotation();
+        if (currentOrient == OrientMode.PORTRAIT) {
+            return (base + 90) % 360;
+        }
+        return base;
     }
 
     // ================================================================
@@ -1004,7 +1140,6 @@ public class MainActivity extends AppCompatActivity {
                     CaptureRequest.Key<Integer> spmKey =
                         new CaptureRequest.Key<>("android.sensor.pixelMode", Integer.class);
                     spb.set(spmKey, 1);
-                    sessConfig.setSessionParameters(spb.build());
                 } catch (Exception ignored) {}
             }
 
@@ -1030,7 +1165,7 @@ public class MainActivity extends AppCompatActivity {
             capBuilder.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, currentEv);
             capBuilder.set(CaptureRequest.JPEG_QUALITY, (byte) JPEG_QUALITY);
 
-            // Set JPEG_ORIENTATION to 0 — we will pixel-rotate ourselves
+            // Set JPEG_ORIENTATION to 0 — we pixel-rotate ourselves
             capBuilder.set(CaptureRequest.JPEG_ORIENTATION, 0);
 
             if (maxRes) {
@@ -1090,12 +1225,11 @@ public class MainActivity extends AppCompatActivity {
                 }
             }, camHandler);
 
-            // Exposure complete — fast feedback
             synchronized (capLock) {
                 if (!capOk[0]) capLock.wait(30_000);
             }
 
-            setStatus("Captured! Processing... (you can move)");
+            setStatusForced("Captured! Processing... (you can move)");
 
             if (!capOk[0]) { session.close(); finishCapture("Capture failed"); return; }
 
@@ -1115,24 +1249,23 @@ public class MainActivity extends AppCompatActivity {
                 default:   mpLabel = "16MP"; break;
             }
 
-            // Compute rotation
-            int sensorRot = sensorOrientation;
-            int portraitExtra = getPortraitExtraRotation();
-            int totalRotation = (sensorRot + portraitExtra) % 360;
+            // Compute rotation using the correct method
+            int totalRotation = getTotalPixelRotation();
 
             StringBuilder receipt = new StringBuilder();
-            receipt.append("═══ CAPTURE RECEIPT ═══\n");
+            receipt.append("\u2550\u2550\u2550 CAPTURE RECEIPT \u2550\u2550\u2550\n");
             receipt.append("Time: ").append(
                 new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(new Date())).append("\n");
             receipt.append("Mode: ").append(mpLabel).append(maxRes ? " (MAX-RES)" : " (DEFAULT)").append("\n");
             receipt.append("Orientation: ").append(currentOrient).append("\n");
-            receipt.append("sensorOrientation: ").append(sensorRot).append("°\n");
-            receipt.append("pixelRotationApplied: ").append(totalRotation).append("°\n");
+            receipt.append("sensorOrientation: ").append(sensorOrientation).append("\u00B0\n");
+            receipt.append("baseRotation: ").append(getBaseRotation()).append("\u00B0\n");
+            receipt.append("pixelRotationApplied: ").append(totalRotation).append("\u00B0\n");
             receipt.append("EV: ").append((currentEv >= 0 ? "+" : "")).append(currentEv).append("\n");
 
             // Save JPEG with pixel rotation
             if (jpegData[0] != null) {
-                setStatus("Processing JPEG...");
+                setStatusForced("Processing JPEG...");
 
                 byte[] finalJpeg = rotateJpegPixels(jpegData[0], totalRotation);
 
@@ -1142,16 +1275,23 @@ public class MainActivity extends AppCompatActivity {
                 int dw = opts.outWidth, dh = opts.outHeight;
                 double mp = (long) dw * dh / 1e6;
 
-                String jname = "FlashCam_" + ts + "_" + mpLabel + ".jpg";
+                // Verify orientation correctness
+                boolean orientCorrect;
+                if (currentOrient == OrientMode.LANDSCAPE) {
+                    orientCorrect = (dw >= dh); // landscape: width >= height
+                } else {
+                    orientCorrect = (dh >= dw); // portrait: height >= width
+                }
 
-                // Save via MediaStore for Gallery visibility
+                String jname = "FlashCam_" + ts + "_" + mpLabel + ".jpg";
                 File savedFile = saveToGallery(finalJpeg, jname, "image/jpeg");
 
-                receipt.append("── JPEG ──\n");
+                receipt.append("\u2500\u2500 JPEG \u2500\u2500\n");
                 receipt.append("Requested: ").append(jpegSize.getWidth()).append("x")
                     .append(jpegSize.getHeight()).append("\n");
                 receipt.append("Actual (after rotation): ").append(dw).append("x").append(dh)
                     .append(" (").append(String.format(Locale.US, "%.1f", mp)).append(" MP)\n");
+                receipt.append("Orientation correct: ").append(orientCorrect ? "YES" : "NO (MISMATCH!)").append("\n");
                 receipt.append("File: ").append(savedFile != null ? savedFile.getAbsolutePath() : "SAVE FAILED").append("\n");
                 receipt.append("Size: ").append(savedFile != null ?
                     String.format(Locale.US, "%,d bytes (%.2f MB)", savedFile.length(),
@@ -1166,41 +1306,51 @@ public class MainActivity extends AppCompatActivity {
                             String.valueOf(ExifInterface.ORIENTATION_NORMAL));
                         exif.setAttribute(ExifInterface.TAG_MAKE, "INMO");
                         exif.setAttribute(ExifInterface.TAG_MODEL, "Air3 IMA301");
-                        exif.setAttribute(ExifInterface.TAG_SOFTWARE, "FlashCam-Air3 v1.3");
+                        exif.setAttribute(ExifInterface.TAG_SOFTWARE, "FlashCam-Air3 v1.4");
                         exif.saveAttributes();
                     } catch (Exception ignored) {}
                 }
 
                 if (maxRes && mp >= 11.5) {
                     receipt.append("VERDICT: FULL-RES CAPTURE CONFIRMED!\n");
-                } else {
+                } else if (orientCorrect) {
                     receipt.append("VERDICT: Capture OK\n");
+                } else {
+                    receipt.append("VERDICT: WARNING - orientation mismatch\n");
                 }
             } else {
-                receipt.append("── JPEG: NO DATA ──\n");
+                receipt.append("\u2500\u2500 JPEG: NO DATA \u2500\u2500\n");
             }
 
             // Save DNG
             if (rawImage[0] != null && capResultHolder[0] != null && camChars != null) {
-                setStatus("Processing DNG...");
+                setStatusForced("Processing DNG...");
                 String dname = "FlashCam_" + ts + "_" + mpLabel + ".dng";
                 try {
                     DngCreator dngCreator = new DngCreator(camChars, capResultHolder[0]);
-                    dngCreator.setDescription("FlashCam-Air3 v1.3");
-                    dngCreator.setOrientation(ExifInterface.ORIENTATION_NORMAL);
+                    dngCreator.setDescription("FlashCam-Air3 v1.4");
+                    // Set DNG orientation based on total rotation
+                    int dngOrientation = ExifInterface.ORIENTATION_NORMAL;
+                    switch (totalRotation) {
+                        case 90:  dngOrientation = ExifInterface.ORIENTATION_ROTATE_90; break;
+                        case 180: dngOrientation = ExifInterface.ORIENTATION_ROTATE_180; break;
+                        case 270: dngOrientation = ExifInterface.ORIENTATION_ROTATE_270; break;
+                    }
+                    dngCreator.setOrientation(dngOrientation);
 
                     File dngFile = saveDngToGallery(dngCreator, rawImage[0], dname);
 
-                    receipt.append("── DNG ──\n");
+                    receipt.append("\u2500\u2500 DNG \u2500\u2500\n");
                     receipt.append("Actual: ").append(dims[1][0]).append("x").append(dims[1][1]).append("\n");
                     receipt.append("File: ").append(dngFile != null ? dngFile.getAbsolutePath() : "SAVE FAILED").append("\n");
                     receipt.append("Size: ").append(dngFile != null ?
                         String.format(Locale.US, "%,d bytes (%.2f MB)", dngFile.length(),
                             dngFile.length() / 1048576.0) : "?").append("\n");
+                    receipt.append("DNG orientation tag: ").append(totalRotation).append("\u00B0\n");
 
                     dngCreator.close();
                 } catch (Exception dngErr) {
-                    receipt.append("── DNG ERROR: ").append(dngErr.getMessage()).append(" ──\n");
+                    receipt.append("\u2500\u2500 DNG ERROR: ").append(dngErr.getMessage()).append(" \u2500\u2500\n");
                 } finally {
                     rawImage[0].close();
                 }
@@ -1208,7 +1358,7 @@ public class MainActivity extends AppCompatActivity {
                 rawImage[0].close();
             }
 
-            receipt.append("═══════════════════════\n");
+            receipt.append("\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n");
 
             lastReceipt = receipt.toString();
             synchronized (receiptLog) {
@@ -1223,7 +1373,7 @@ public class MainActivity extends AppCompatActivity {
                 }
             });
 
-            setStatus("Saved! " + mpLabel);
+            setStatusForced("Saved! " + mpLabel);
 
         } catch (Exception e) {
             finishCapture("Error: " + e.getMessage());
@@ -1240,7 +1390,7 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void finishCapture(String msg) {
-        setStatus(msg);
+        setStatusForced(msg);
         capturing = false;
         try { Thread.sleep(300); } catch (InterruptedException ignored) {}
         if (cameraDevice != null) startPreview();
@@ -1292,12 +1442,12 @@ public class MainActivity extends AppCompatActivity {
                 mediaRecorder.setAudioEncodingBitRate(128_000);
                 mediaRecorder.setAudioSamplingRate(44100);
 
-                // Orientation hint for portrait
+                // Orientation hint
+                int orientHint = getBaseRotation();
                 if (currentOrient == OrientMode.PORTRAIT) {
-                    mediaRecorder.setOrientationHint((sensorOrientation + 90) % 360);
-                } else {
-                    mediaRecorder.setOrientationHint(sensorOrientation);
+                    orientHint = (orientHint + 90) % 360;
                 }
+                mediaRecorder.setOrientationHint(orientHint);
 
                 mediaRecorder.prepare();
 
@@ -1342,7 +1492,7 @@ public class MainActivity extends AppCompatActivity {
                 }
 
                 if (sessResult[0] != 0) {
-                    setStatus("Video session failed");
+                    transitionState(CamState.ERROR);
                     return;
                 }
 
@@ -1350,10 +1500,10 @@ public class MainActivity extends AppCompatActivity {
                 mediaRecorder.start();
                 isRecording = true;
 
+                transitionState(CamState.RECORDING);
                 mainHandler.post(() -> {
-                    setStatus("REC");
                     tvRecTimer.setVisibility(View.VISIBLE);
-                    tvRecTimer.setText("● REC");
+                    tvRecTimer.setText("\u25CF REC");
                     tvRecTimer.setTextColor(COLOR_RED);
                     chronoRec.setVisibility(View.VISIBLE);
                     chronoRec.setBase(SystemClock.elapsedRealtime());
@@ -1362,7 +1512,7 @@ public class MainActivity extends AppCompatActivity {
                 });
 
             } catch (Exception e) {
-                setStatus("Record error: " + e.getMessage());
+                setStatusForced("Record error: " + e.getMessage());
                 isRecording = false;
             }
         });
@@ -1385,21 +1535,20 @@ public class MainActivity extends AppCompatActivity {
                     tvRecTimer.setVisibility(View.GONE);
                 });
 
-                // Scan for gallery
                 if (currentVideoPath != null) {
                     MediaScannerConnection.scanFile(this,
                         new String[]{currentVideoPath}, new String[]{"video/mp4"}, null);
                 }
 
-                setStatus("Video saved: " + currentVideoPath);
+                setStatusForced("Video saved: " + currentVideoPath);
 
                 if (debugEnabled) {
                     File vf = new File(currentVideoPath);
-                    String receipt = "═══ VIDEO RECEIPT ═══\n"
+                    String receipt = "\u2550\u2550\u2550 VIDEO RECEIPT \u2550\u2550\u2550\n"
                         + "File: " + currentVideoPath + "\n"
                         + "Size: " + String.format(Locale.US, "%,d bytes (%.2f MB)",
                             vf.length(), vf.length() / 1048576.0) + "\n"
-                        + "═══════════════════════\n";
+                        + "\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n";
                     lastReceipt = receipt;
                     mainHandler.post(() -> {
                         tvReceipt.setText(receipt);
@@ -1408,10 +1557,9 @@ public class MainActivity extends AppCompatActivity {
                 }
 
             } catch (Exception e) {
-                setStatus("Stop error: " + e.getMessage());
+                setStatusForced("Stop error: " + e.getMessage());
             }
 
-            // Restart preview
             try { Thread.sleep(300); } catch (InterruptedException ignored) {}
             startPreview();
         });
@@ -1431,13 +1579,12 @@ public class MainActivity extends AppCompatActivity {
             fos.write(data);
             fos.close();
 
-            // Trigger media scan
             MediaScannerConnection.scanFile(this,
                 new String[]{file.getAbsolutePath()}, new String[]{mimeType}, null);
 
             return file;
         } catch (Exception e) {
-            setStatus("Save error: " + e.getMessage());
+            setStatusForced("Save error: " + e.getMessage());
             return null;
         }
     }
@@ -1458,7 +1605,7 @@ public class MainActivity extends AppCompatActivity {
 
             return file;
         } catch (Exception e) {
-            setStatus("DNG save error: " + e.getMessage());
+            setStatusForced("DNG save error: " + e.getMessage());
             return null;
         }
     }
@@ -1490,7 +1637,7 @@ public class MainActivity extends AppCompatActivity {
                 if (!dir.exists()) dir.mkdirs();
                 File f = new File(dir, "flashcam_log.txt");
                 FileWriter w = new FileWriter(f, false);
-                w.write("FlashCam-Air3 v1.3 Log — " + receiptLog.size() + " captures\n");
+                w.write("FlashCam-Air3 v1.4 Log \u2014 " + receiptLog.size() + " captures\n");
                 w.write("Exported: " + new SimpleDateFormat("yyyy-MM-dd HH:mm:ss",
                     Locale.US).format(new Date()) + "\n\n");
                 for (String r : receiptLog) { w.write(r); w.write("\n"); }
@@ -1507,10 +1654,6 @@ public class MainActivity extends AppCompatActivity {
     // ================================================================
     // UTILITY
     // ================================================================
-    private void setStatus(String msg) {
-        mainHandler.post(() -> tvStatus.setText(msg));
-    }
-
     private String fmtSize(Size s) {
         return s != null ? s.getWidth() + "x" + s.getHeight() : "?";
     }
