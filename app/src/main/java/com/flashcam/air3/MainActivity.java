@@ -3,6 +3,7 @@ package com.flashcam.air3;
 import android.Manifest;
 import android.content.ClipData;
 import android.content.ClipboardManager;
+import android.content.ContentValues;
 import android.content.Context;
 import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
@@ -31,6 +32,7 @@ import android.media.ImageReader;
 import android.media.MediaRecorder;
 import android.media.MediaScannerConnection;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
 import android.os.Handler;
@@ -38,6 +40,7 @@ import android.os.HandlerThread;
 import android.os.Looper;
 import android.os.SystemClock;
 import android.provider.MediaStore;
+import android.util.Log;
 import android.util.Range;
 import android.util.Size;
 import android.view.MotionEvent;
@@ -73,22 +76,26 @@ import java.util.Locale;
 import java.util.concurrent.Executor;
 
 /**
- * FlashCam-Air3 v1.4
+ * FlashCam-Air3 v1.5
  *
  * Full-featured camera for INMO Air3 glasses.
  * - 8MP / 12MP / 16MP still capture (max-res via SENSOR_PIXEL_MODE)
+ * - PORTRAIT = center-crop to 3:4 from the landscape capture (no world rotation)
+ * - LANDSCAPE = full frame, upright
+ * - Deterministic pixel rotation with auto-correct
  * - DNG toggle (proper DngCreator output)
- * - Correct orientation with pixel rotation for landscape and portrait
  * - Letterboxed preview with capture-frame overlay
- * - Tap-to-focus + EV compensation
+ * - Tap-to-focus mapped within crop region
+ * - EV compensation
  * - Video: 1080p30 / 4K30
- * - Gallery integration via MediaStore
+ * - Gallery integration via MediaStore (scoped storage safe)
  * - Orange + Black branding
  *
  * Developed with assistance from Manus AI and ChatGPT (OpenAI)
  */
 public class MainActivity extends AppCompatActivity {
 
+    private static final String TAG = "FlashCam";
     private static final int PERM_REQUEST = 100;
     private static final long OPEN_TIMEOUT_MS = 60_000;
     private static final int JPEG_QUALITY = 100;
@@ -130,13 +137,13 @@ public class MainActivity extends AppCompatActivity {
     private volatile boolean capturing = false;
 
     // ── Sizes ──
-    private Size defaultJpegSize;       // from default stream map
-    private Size maxResJpegSize;        // from max-res stream map (16MP)
-    private Size maxResRawSize;         // from max-res stream map (RAW)
+    private Size defaultJpegSize;
+    private Size maxResJpegSize;
+    private Size maxResRawSize;
     private Size previewSize;
     private boolean hasRaw = false;
 
-    // ── All available JPEG sizes (for 8/12MP selection) ──
+    // ── All available JPEG sizes ──
     private Size[] defaultJpegSizes;
     private Size[] maxResJpegSizes;
 
@@ -174,13 +181,11 @@ public class MainActivity extends AppCompatActivity {
     // ── Video sizes ──
     private boolean has4K = false;
 
-    // ── Status state machine (fix flicker) ──
+    // ── Status state machine ──
     private enum CamState { INITIALIZING, OPENING, READY, CAPTURING, RECORDING, ERROR }
     private volatile CamState camState = CamState.INITIALIZING;
     private volatile long lastStatusChangeMs = 0;
     private static final long STATUS_THROTTLE_MS = 300;
-
-    // CaptureFrameOverlayView is now a standalone class (CaptureFrameOverlayView.java)
 
     // ================================================================
     // LIFECYCLE
@@ -254,7 +259,6 @@ public class MainActivity extends AppCompatActivity {
         textureView.setOnTouchListener((v, event) -> {
             if (event.getAction() == MotionEvent.ACTION_DOWN && !isRecording) {
                 float tx = event.getX(), ty = event.getY();
-                // If overlay is showing, ignore taps outside the clear rect
                 if (captureFrameOverlay != null && !captureFrameOverlay.isInsideClearRect(tx, ty)) {
                     return false;
                 }
@@ -270,26 +274,82 @@ public class MainActivity extends AppCompatActivity {
     private void showCredits() {
         new android.app.AlertDialog.Builder(this)
             .setTitle("FlashCam-Air3 Credits")
-            .setMessage("FlashCam-Air3 v1.4\n\n"
+            .setMessage("FlashCam-Air3 v1.5\n\n"
                 + "Developed with assistance from Manus AI and ChatGPT (OpenAI)\n\n"
-                + "Unlocks the full 16MP camera on INMO Air3 AR glasses "
-                + "using the standard Android Camera2 API.\n\n"
-                + "No root required.\n\n"
-                + "https://manus.im\nhttps://openai.com\n\n"
-                + "License: MIT")
+                + "Unlocks the full 16MP sensor on INMO Air3 glasses using the "
+                + "standard Android Camera2 SENSOR_PIXEL_MODE = MAXIMUM_RESOLUTION API.\n\n"
+                + "No root required. No vendor file edits. No firmware mods.\n\n"
+                + "https://manus.im\nhttps://openai.com\n"
+                + "https://github.com/Flash-Bri/FlashCam-Air3")
             .setPositiveButton("OK", null)
             .show();
     }
 
+    @Override
+    protected void onResume() {
+        super.onResume();
+        if (camThread == null || !camThread.isAlive()) {
+            camThread = new HandlerThread("CamThread");
+            camThread.start();
+            camHandler = new Handler(camThread.getLooper());
+        }
+        if (workerThread == null || !workerThread.isAlive()) {
+            workerThread = new HandlerThread("WorkerThread");
+            workerThread.start();
+            workerHandler = new Handler(workerThread.getLooper());
+        }
+        if (textureView.isAvailable() && cameraDevice == null && cameraId != null) {
+            workerHandler.post(this::openCamera);
+        }
+    }
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+        closeCamera();
+    }
+
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        closeCamera();
+        if (camThread != null) { camThread.quitSafely(); camThread = null; }
+        if (workerThread != null) { workerThread.quitSafely(); workerThread = null; }
+    }
+
+    private void closeCamera() {
+        try {
+            if (isRecording) {
+                try { mediaRecorder.stop(); } catch (Exception ignored) {}
+                try { mediaRecorder.release(); } catch (Exception ignored) {}
+                mediaRecorder = null;
+                isRecording = false;
+            }
+            if (previewSession != null) { previewSession.close(); previewSession = null; }
+            if (cameraDevice != null) { cameraDevice.close(); cameraDevice = null; }
+        } catch (Exception ignored) {}
+    }
+
+    // ================================================================
+    // PERMISSIONS
+    // ================================================================
     private void requestPermissions() {
-        String[] perms = {
-            Manifest.permission.CAMERA,
-            Manifest.permission.RECORD_AUDIO
-        };
+        List<String> perms = new ArrayList<>();
+        perms.add(Manifest.permission.CAMERA);
+        perms.add(Manifest.permission.RECORD_AUDIO);
+        if (Build.VERSION.SDK_INT >= 33) {
+            perms.add(Manifest.permission.READ_MEDIA_IMAGES);
+            perms.add(Manifest.permission.READ_MEDIA_VIDEO);
+        } else {
+            perms.add(Manifest.permission.WRITE_EXTERNAL_STORAGE);
+            perms.add(Manifest.permission.READ_EXTERNAL_STORAGE);
+        }
+
         List<String> needed = new ArrayList<>();
         for (String p : perms) {
-            if (ContextCompat.checkSelfPermission(this, p) != PackageManager.PERMISSION_GRANTED)
+            if (ContextCompat.checkSelfPermission(this, p) != PackageManager.PERMISSION_GRANTED) {
                 needed.add(p);
+            }
         }
         if (!needed.isEmpty()) {
             ActivityCompat.requestPermissions(this, needed.toArray(new String[0]), PERM_REQUEST);
@@ -299,44 +359,20 @@ public class MainActivity extends AppCompatActivity {
     }
 
     @Override
-    public void onRequestPermissionsResult(int requestCode,
-            @NonNull String[] permissions, @NonNull int[] grantResults) {
+    public void onRequestPermissionsResult(int requestCode, @NonNull String[] permissions,
+            @NonNull int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
         if (requestCode == PERM_REQUEST) {
             boolean cameraGranted = false;
             for (int i = 0; i < permissions.length; i++) {
-                if (permissions[i].equals(Manifest.permission.CAMERA)
-                        && grantResults[i] == PackageManager.PERMISSION_GRANTED)
+                if (Manifest.permission.CAMERA.equals(permissions[i])
+                        && grantResults[i] == PackageManager.PERMISSION_GRANTED) {
                     cameraGranted = true;
+                }
             }
             if (cameraGranted) initCamera();
             else setStatusForced("Camera permission denied");
         }
-    }
-
-    @Override
-    protected void onResume() {
-        super.onResume();
-        if (cameraDevice == null && textureView.isAvailable()
-                && ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
-                    == PackageManager.PERMISSION_GRANTED) {
-            workerHandler.post(this::openCamera);
-        }
-    }
-
-    @Override
-    protected void onPause() {
-        super.onPause();
-        if (isRecording) stopRecording();
-        closeCamera();
-    }
-
-    @Override
-    protected void onDestroy() {
-        super.onDestroy();
-        closeCamera();
-        if (camThread != null) camThread.quitSafely();
-        if (workerThread != null) workerThread.quitSafely();
     }
 
     // ================================================================
@@ -346,70 +382,75 @@ public class MainActivity extends AppCompatActivity {
         try {
             String[] ids = cameraManager.getCameraIdList();
             for (String id : ids) {
-                CameraCharacteristics c = cameraManager.getCameraCharacteristics(id);
-                Integer facing = c.get(CameraCharacteristics.LENS_FACING);
-                if (facing != null && facing == CameraCharacteristics.LENS_FACING_FRONT) continue;
-
-                cameraId = id;
-                camChars = c;
-
-                Integer so = c.get(CameraCharacteristics.SENSOR_ORIENTATION);
-                sensorOrientation = (so != null) ? so : 0;
-
-                sensorArraySize = c.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE);
-                minFocusDist = c.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE);
-                canAF = (minFocusDist != null && minFocusDist > 0);
-
-                evRange = c.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE);
-                if (evRange != null) {
-                    mainHandler.post(() -> { btnEvMinus.setEnabled(true); btnEvPlus.setEnabled(true); });
+                CameraCharacteristics cc = cameraManager.getCameraCharacteristics(id);
+                Integer facing = cc.get(CameraCharacteristics.LENS_FACING);
+                if (facing != null && facing == CameraCharacteristics.LENS_FACING_BACK) {
+                    cameraId = id;
+                    camChars = cc;
+                    break;
                 }
-
-                // Default stream map
-                StreamConfigurationMap defMap =
-                    c.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
-                if (defMap != null) {
-                    defaultJpegSizes = defMap.getOutputSizes(ImageFormat.JPEG);
-                    if (defaultJpegSizes != null) defaultJpegSize = findLargest(defaultJpegSizes);
-
-                    Size[] privSizes = defMap.getOutputSizes(SurfaceTexture.class);
-                    if (privSizes != null) previewSize = findBest43Preview(privSizes);
-
-                    // Check video sizes
-                    Size[] videoSizes = defMap.getOutputSizes(MediaRecorder.class);
-                    if (videoSizes != null) {
-                        for (Size vs : videoSizes) {
-                            if (vs.getWidth() >= 3840 && vs.getHeight() >= 2160) has4K = true;
-                        }
-                    }
-                }
-
-                // Max-res stream map
-                try {
-                    CameraCharacteristics.Key<StreamConfigurationMap> kMRM =
-                        new CameraCharacteristics.Key<>(
-                            "android.scaler.streamConfigurationMapMaximumResolution",
-                            StreamConfigurationMap.class);
-                    StreamConfigurationMap mrMap = c.get(kMRM);
-                    if (mrMap != null) {
-                        maxResJpegSizes = mrMap.getOutputSizes(ImageFormat.JPEG);
-                        if (maxResJpegSizes != null) maxResJpegSize = findLargest(maxResJpegSizes);
-
-                        Size[] mrRaw = null;
-                        try { mrRaw = mrMap.getOutputSizes(ImageFormat.RAW_SENSOR); }
-                        catch (Exception ignored) {}
-                        if (mrRaw != null && mrRaw.length > 0) {
-                            maxResRawSize = findLargest(mrRaw);
-                            hasRaw = true;
-                        }
-                    }
-                } catch (Exception ignored) {}
-
-                break;
             }
-
+            if (cameraId == null && ids.length > 0) {
+                cameraId = ids[0];
+                camChars = cameraManager.getCameraCharacteristics(cameraId);
+            }
             if (cameraId == null) { setStatusForced("No camera found"); return; }
 
+            Integer so = camChars.get(CameraCharacteristics.SENSOR_ORIENTATION);
+            sensorOrientation = (so != null) ? so : 0;
+
+            sensorArraySize = camChars.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE);
+
+            minFocusDist = camChars.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE);
+            canAF = (minFocusDist != null && minFocusDist > 0);
+
+            evRange = camChars.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE);
+
+            // Default stream map
+            StreamConfigurationMap defaultMap =
+                camChars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
+            if (defaultMap != null) {
+                defaultJpegSizes = defaultMap.getOutputSizes(ImageFormat.JPEG);
+                if (defaultJpegSizes != null && defaultJpegSizes.length > 0) {
+                    defaultJpegSize = findLargest(defaultJpegSizes);
+                }
+                Size[] previewSizes = defaultMap.getOutputSizes(SurfaceTexture.class);
+                if (previewSizes != null && previewSizes.length > 0) {
+                    previewSize = findBest43Preview(previewSizes);
+                }
+                // Check for 4K video
+                Size[] videoSizes = defaultMap.getOutputSizes(MediaRecorder.class);
+                if (videoSizes != null) {
+                    for (Size s : videoSizes) {
+                        if (s.getWidth() >= 3840 && s.getHeight() >= 2160) { has4K = true; break; }
+                    }
+                }
+            }
+
+            // Max-res stream map (API 31+)
+            try {
+                Object maxResMap = camChars.getClass()
+                    .getMethod("get", CameraCharacteristics.Key.class)
+                    .invoke(camChars, new CameraCharacteristics.Key<StreamConfigurationMap>(
+                        "android.scaler.streamConfigurationMapMaximumResolution",
+                        StreamConfigurationMap.class));
+                if (maxResMap instanceof StreamConfigurationMap) {
+                    StreamConfigurationMap mrMap = (StreamConfigurationMap) maxResMap;
+                    maxResJpegSizes = mrMap.getOutputSizes(ImageFormat.JPEG);
+                    if (maxResJpegSizes != null && maxResJpegSizes.length > 0) {
+                        maxResJpegSize = findLargest(maxResJpegSizes);
+                    }
+                    Size[] rawSizes = mrMap.getOutputSizes(ImageFormat.RAW_SENSOR);
+                    if (rawSizes != null && rawSizes.length > 0) {
+                        maxResRawSize = findLargest(rawSizes);
+                        hasRaw = true;
+                    }
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "Max-res stream map not available: " + e.getMessage());
+            }
+
+            // Register availability callback
             cameraManager.registerAvailabilityCallback(new CameraManager.AvailabilityCallback() {
                 @Override public void onCameraAvailable(@NonNull String id) {
                     if (id.equals(cameraId)) cameraAvailable = true;
@@ -417,15 +458,11 @@ public class MainActivity extends AppCompatActivity {
                 @Override public void onCameraUnavailable(@NonNull String id) {
                     if (id.equals(cameraId)) cameraAvailable = false;
                 }
-            }, camHandler);
+            }, mainHandler);
 
-            updateAllUI();
-            setStatusForced("Ready | Sensor:" + sensorOrientation + "\u00B0"
-                + " | Max:" + fmtSize(maxResJpegSize)
-                + (hasRaw ? " | RAW:" + fmtSize(maxResRawSize) : "")
-                + (has4K ? " | 4K" : ""));
-
-            if (textureView.isAvailable()) workerHandler.post(this::openCamera);
+            if (textureView.isAvailable()) {
+                workerHandler.post(this::openCamera);
+            }
 
         } catch (Exception e) {
             setStatusForced("Init error: " + e.getMessage());
@@ -433,77 +470,67 @@ public class MainActivity extends AppCompatActivity {
     }
 
     // ================================================================
-    // CAMERA OPEN / CLOSE
+    // CAMERA OPEN (with retry)
     // ================================================================
     private void openCamera() {
-        if (cameraId == null || !textureView.isAvailable()) return;
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
+        if (cameraId == null || cameraDevice != null) return;
+        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
                 != PackageManager.PERMISSION_GRANTED) return;
 
-        transitionState(CamState.OPENING);
-        long t0 = System.currentTimeMillis();
-        while (!cameraAvailable && System.currentTimeMillis() - t0 < 5000) {
-            try { Thread.sleep(100); } catch (InterruptedException ignored) {}
-        }
+        for (int attempt = 1; attempt <= 3; attempt++) {
+            transitionState(CamState.OPENING);
+            final int att = attempt;
+            setStatusForced("Opening camera (attempt " + att + "/3)...");
 
-        final Object lock = new Object();
-        final int[] result = {-999};
+            try {
+                final Object lock = new Object();
+                final int[] result = {-999};
 
-        try {
-            Executor exec = camHandler::post;
-            cameraManager.openCamera(cameraId, exec, new CameraDevice.StateCallback() {
-                @Override public void onOpened(@NonNull CameraDevice camera) {
-                    cameraDevice = camera;
-                    synchronized (lock) { result[0] = 0; lock.notifyAll(); }
-                }
-                @Override public void onDisconnected(@NonNull CameraDevice camera) {
-                    camera.close(); cameraDevice = null;
-                    synchronized (lock) { result[0] = -1; lock.notifyAll(); }
-                    transitionState(CamState.ERROR);
-                    mainHandler.post(() -> btnShutter.setEnabled(false));
-                    workerHandler.postDelayed(() -> openCamera(), 2000);
-                }
-                @Override public void onError(@NonNull CameraDevice camera, int error) {
-                    camera.close(); cameraDevice = null;
-                    synchronized (lock) { result[0] = error; lock.notifyAll(); }
-                    transitionState(CamState.ERROR);
-                    mainHandler.post(() -> btnShutter.setEnabled(false));
-                    workerHandler.postDelayed(() -> openCamera(), 3000);
-                }
-            });
+                Executor exec = camHandler::post;
+                cameraManager.openCamera(cameraId, exec, new CameraDevice.StateCallback() {
+                    @Override public void onOpened(@NonNull CameraDevice camera) {
+                        cameraDevice = camera;
+                        synchronized (lock) { result[0] = 0; lock.notifyAll(); }
+                    }
+                    @Override public void onDisconnected(@NonNull CameraDevice camera) {
+                        camera.close(); cameraDevice = null;
+                        synchronized (lock) { result[0] = -2; lock.notifyAll(); }
+                    }
+                    @Override public void onError(@NonNull CameraDevice camera, int error) {
+                        camera.close(); cameraDevice = null;
+                        synchronized (lock) { result[0] = error; lock.notifyAll(); }
+                    }
+                });
 
-            synchronized (lock) {
-                if (result[0] == -999) lock.wait(OPEN_TIMEOUT_MS);
+                synchronized (lock) {
+                    if (result[0] == -999) lock.wait(OPEN_TIMEOUT_MS);
+                }
+
+                if (result[0] == 0 && cameraDevice != null) {
+                    startPreview();
+                    return;
+                }
+
+                setStatusForced("Open failed (code " + result[0] + "), retry in 2s...");
+                Thread.sleep(2000);
+
+            } catch (Exception e) {
+                setStatusForced("Open error: " + e.getMessage());
+                try { Thread.sleep(2000); } catch (InterruptedException ignored) {}
             }
-
-            if (result[0] == 0 && cameraDevice != null) {
-                startPreview();
-            } else {
-                transitionState(CamState.ERROR);
-            }
-        } catch (Exception e) {
-            transitionState(CamState.ERROR);
         }
-    }
-
-    private void closeCamera() {
-        try { if (previewSession != null) { previewSession.close(); previewSession = null; } }
-        catch (Exception ignored) {}
-        try { if (cameraDevice != null) { cameraDevice.close(); cameraDevice = null; } }
-        catch (Exception ignored) {}
-        previewRequestBuilder = null;
-        mainHandler.post(() -> btnShutter.setEnabled(false));
+        transitionState(CamState.ERROR);
     }
 
     // ================================================================
-    // STATUS STATE MACHINE (fixes flicker)
+    // STATUS STATE MACHINE
     // ================================================================
     private void transitionState(CamState newState) {
-        if (newState == camState) return; // no-op if same state
+        if (newState == camState) return;
         long now = System.currentTimeMillis();
         if (now - lastStatusChangeMs < STATUS_THROTTLE_MS && newState != CamState.ERROR
                 && newState != CamState.CAPTURING && newState != CamState.RECORDING) {
-            return; // throttle rapid transitions
+            return;
         }
         camState = newState;
         lastStatusChangeMs = now;
@@ -520,7 +547,6 @@ public class MainActivity extends AppCompatActivity {
         mainHandler.post(() -> tvStatus.setText(msg));
     }
 
-    /** Force a status update regardless of throttle (for info messages) */
     private void setStatusForced(String msg) {
         lastStatusChangeMs = 0;
         mainHandler.post(() -> tvStatus.setText(msg));
@@ -629,7 +655,6 @@ public class MainActivity extends AppCompatActivity {
         Matrix matrix = new Matrix();
         float centerX = viewW / 2f, centerY = viewH / 2f;
 
-        // FIT: scale = MIN so the entire preview is visible (letterboxed)
         float scaleX = (float) viewW / previewW;
         float scaleY = (float) viewH / previewH;
         float scale = Math.min(scaleX, scaleY);
@@ -638,16 +663,14 @@ public class MainActivity extends AppCompatActivity {
     }
 
     // ================================================================
-    // CAPTURE FRAME OVERLAY (shows exact capture area)
+    // CAPTURE FRAME OVERLAY
     // ================================================================
     private void updateCaptureFrameOverlay() {
-        if (captureFrameOverlay == null || textureView == null) return;
-        if (previewSize == null) return;
+        if (captureFrameOverlay == null || textureView == null || previewSize == null) return;
 
         int viewW = textureView.getWidth(), viewH = textureView.getHeight();
         if (viewW == 0 || viewH == 0) return;
 
-        // The preview is letterboxed (FIT). Compute the visible preview area.
         int previewW = previewSize.getWidth(), previewH = previewSize.getHeight();
         float scaleX = (float) viewW / previewW;
         float scaleY = (float) viewH / previewH;
@@ -658,22 +681,18 @@ public class MainActivity extends AppCompatActivity {
         float offsetX = (viewW - renderedW) / 2f;
         float offsetY = (viewH - renderedH) / 2f;
 
-        // The capture area within the preview depends on orientation mode.
-        // Preview is always 4:3 landscape. Capture is:
-        //   LANDSCAPE: full preview area (4:3 landscape)
-        //   PORTRAIT:  a 3:4 portrait crop from the center of the preview
         RectF clearRect;
         if (currentOrient == OrientMode.PORTRAIT) {
-            // Portrait: 3:4 aspect within the 4:3 preview
-            float captureAspect = 3f / 4f; // width/height for portrait
+            // Portrait: 3:4 aspect (width < height) center-cropped from the 4:3 preview
+            // The preview is landscape (W > H). A 3:4 portrait crop means:
+            // cropAspect = 3/4 = 0.75 (width/height)
+            float captureAspect = 3f / 4f;
             float previewAspect = renderedW / renderedH;
             float cropW, cropH;
             if (captureAspect < previewAspect) {
-                // Height-limited
                 cropH = renderedH;
                 cropW = cropH * captureAspect;
             } else {
-                // Width-limited
                 cropW = renderedW;
                 cropH = cropW / captureAspect;
             }
@@ -681,7 +700,6 @@ public class MainActivity extends AppCompatActivity {
             clearRect = new RectF(cx - cropW / 2f, cy - cropH / 2f,
                                    cx + cropW / 2f, cy + cropH / 2f);
         } else {
-            // Landscape: full preview area
             clearRect = new RectF(offsetX, offsetY,
                                    offsetX + renderedW, offsetY + renderedH);
         }
@@ -690,7 +708,7 @@ public class MainActivity extends AppCompatActivity {
     }
 
     // ================================================================
-    // TAP-TO-FOCUS (with letterbox coordinate mapping)
+    // TAP-TO-FOCUS (mapped within crop region for portrait)
     // ================================================================
     private void handleTapToFocus(float touchX, float touchY) {
         if (previewSession == null || previewRequestBuilder == null || cameraDevice == null) return;
@@ -699,7 +717,7 @@ public class MainActivity extends AppCompatActivity {
         int viewW = textureView.getWidth(), viewH = textureView.getHeight();
         if (viewW == 0 || viewH == 0) return;
 
-        // Map touch coordinates to sensor coordinates, accounting for letterbox
+        // Get the letterbox offset
         int previewW = previewSize.getWidth(), previewH = previewSize.getHeight();
         float scaleX = (float) viewW / previewW;
         float scaleY = (float) viewH / previewH;
@@ -709,11 +727,15 @@ public class MainActivity extends AppCompatActivity {
         float offsetX = (viewW - renderedW) / 2f;
         float offsetY = (viewH - renderedH) / 2f;
 
-        // Normalize within the rendered preview area
+        // Map touch to normalized preview coordinates (0..1)
         float normX = (touchX - offsetX) / renderedW;
         float normY = (touchY - offsetY) / renderedH;
         normX = Math.max(0f, Math.min(1f, normX));
         normY = Math.max(0f, Math.min(1f, normY));
+
+        // For portrait mode, the tap is already within the clearRect (checked by listener).
+        // The normX/normY above maps to the full sensor, which is correct because
+        // the crop happens post-capture. The sensor still sees the full frame during preview.
 
         int sW = sensorArraySize.width(), sH = sensorArraySize.height();
         int regionW = (int)(sW * 0.1f), regionH = (int)(sH * 0.1f);
@@ -822,7 +844,6 @@ public class MainActivity extends AppCompatActivity {
 
     private void updateAllUI() {
         mainHandler.post(() -> {
-            // MP mode
             String mpLabel;
             switch (currentMp) {
                 case MP8:  mpLabel = "8 MP"; break;
@@ -832,15 +853,12 @@ public class MainActivity extends AppCompatActivity {
             btnMode.setText(mpLabel);
             tvMode.setText(mpLabel + (currentOrient == OrientMode.PORTRAIT ? " PORT" : " LAND"));
 
-            // DNG
             btnDng.setText(dngEnabled ? "DNG:ON" : "DNG:OFF");
             btnDng.setBackgroundTintList(android.content.res.ColorStateList.valueOf(
                 dngEnabled ? COLOR_ORANGE : 0xFF333333));
 
-            // Orientation
             btnOrientation.setText(currentOrient == OrientMode.LANDSCAPE ? "LAND" : "PORT");
 
-            // Video
             String vidLabel;
             switch (currentVideo) {
                 case V1080P: vidLabel = "1080p"; break;
@@ -849,22 +867,18 @@ public class MainActivity extends AppCompatActivity {
             }
             btnVideo.setText(vidLabel);
 
-            // Shutter appearance — always set the drawable, never change container bg
             if (currentVideo != VideoMode.OFF) {
                 btnShutter.setBackground(getDrawable(R.drawable.record_button));
             } else {
                 btnShutter.setBackground(getDrawable(R.drawable.shutter_button));
             }
 
-            // Debug
             btnDebug.setText(debugEnabled ? "DBG:ON" : "DBG:OFF");
             btnDebug.setBackgroundTintList(android.content.res.ColorStateList.valueOf(
                 debugEnabled ? COLOR_ORANGE_DIM : 0xFF222222));
 
-            // EV
             updateEvUI();
 
-            // Recording timer
             if (!isRecording) {
                 if (chronoRec != null) chronoRec.setVisibility(View.GONE);
             }
@@ -899,12 +913,10 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
 
-        // Photo mode
         if (capturing) return;
         capturing = true;
         btnShutter.setEnabled(false);
 
-        // Shutter flash animation — on the dedicated overlay, not the container
         flashShutter();
         transitionState(CamState.CAPTURING);
 
@@ -933,11 +945,6 @@ public class MainActivity extends AppCompatActivity {
         });
     }
 
-    /**
-     * Flash animation using a dedicated overlay view.
-     * The overlay briefly goes white then fades to transparent.
-     * The shutter button and container background are NEVER changed.
-     */
     private void flashShutter() {
         mainHandler.post(() -> {
             if (shutterFlashOverlay != null) {
@@ -957,7 +964,7 @@ public class MainActivity extends AppCompatActivity {
     }
 
     // ================================================================
-    // SIZE SELECTION — orientation-aware
+    // SIZE SELECTION
     // ================================================================
     private Size getTargetJpegSize() {
         long targetPixels;
@@ -967,15 +974,11 @@ public class MainActivity extends AppCompatActivity {
             default:   targetPixels = 16_000_000L; break;
         }
 
-        // For 16MP, always use max-res
         if (currentMp == MpMode.MP16 && maxResJpegSize != null) {
             return maxResJpegSize;
         }
 
-        // Try default map first (for 8MP/12MP)
         Size best = findClosestSize(defaultJpegSizes, targetPixels);
-
-        // If default map doesn't have a good match, try max-res map
         if (best != null) {
             long bestPx = (long) best.getWidth() * best.getHeight();
             if (bestPx < targetPixels * 0.5 && maxResJpegSizes != null) {
@@ -985,13 +988,12 @@ public class MainActivity extends AppCompatActivity {
             return best;
         }
 
-        // Fallback
         if (maxResJpegSizes != null) {
             Size mrBest = findClosestSize(maxResJpegSizes, targetPixels);
             if (mrBest != null) return mrBest;
         }
 
-        return maxResJpegSize != null ? maxResJpegSize : defaultJpegSize;
+        return defaultJpegSize != null ? defaultJpegSize : new Size(2048, 1536);
     }
 
     private boolean needsMaxRes() {
@@ -1018,11 +1020,17 @@ public class MainActivity extends AppCompatActivity {
     }
 
     // ================================================================
-    // ORIENTATION — correct computation
+    // ORIENTATION — deterministic, with auto-correct
     // ================================================================
+
     /**
-     * Compute the base JPEG orientation (how many degrees CW to rotate
-     * the sensor image so it appears upright on the device display).
+     * Returns the CW rotation needed to make the sensor output upright
+     * for the current device display orientation.
+     *
+     * For INMO Air3 (sensorOrientation=270, always landscape display rotation=0):
+     *   baseRotation = (270 - 0 + 360) % 360 = 270
+     *
+     * This is the rotation for LANDSCAPE output (full frame, upright, W > H).
      */
     private int getBaseRotation() {
         int deviceRotation = 0;
@@ -1031,7 +1039,6 @@ public class MainActivity extends AppCompatActivity {
             int[] degreesMap = {0, 90, 180, 270};
             deviceRotation = degreesMap[displayRotation];
         } catch (Exception ignored) {}
-        // For a back-facing camera:
         return (sensorOrientation - deviceRotation + 360) % 360;
     }
 
@@ -1059,137 +1066,87 @@ public class MainActivity extends AppCompatActivity {
 
             return bos.toByteArray();
         } catch (Exception e) {
+            Log.e(TAG, "Pixel rotation failed", e);
             return jpegData;
         }
     }
 
     /**
-     * Compute the total pixel rotation to apply.
+     * Center-crop a JPEG to 3:4 portrait aspect ratio.
+     * Input is expected to be an upright landscape image (W > H).
+     * Output is a portrait image (H > W) with the center portion preserved.
      *
-     * LANDSCAPE mode: rotate by baseRotation so the image is upright landscape.
-     * PORTRAIT mode:  rotate by (baseRotation + 90) so the image is upright portrait
-     *                 (height > width).
+     * Returns: Object[] {croppedJpegBytes, cropX, cropY, cropW, cropH}
+     * The crop info is returned for the receipt.
      */
-    private int getTotalPixelRotation() {
-        int base = getBaseRotation();
-        if (currentOrient == OrientMode.PORTRAIT) {
-            return (base + 90) % 360;
+    private Object[] cropToPortrait(byte[] jpegData) {
+        try {
+            Bitmap bmp = BitmapFactory.decodeByteArray(jpegData, 0, jpegData.length);
+            if (bmp == null) return new Object[]{jpegData, 0, 0, 0, 0};
+
+            int w = bmp.getWidth(), h = bmp.getHeight();
+            // Target: 3:4 (portrait). From landscape W>H, crop width.
+            float targetAspect = 3f / 4f; // width / height
+            int cropW, cropH;
+            if ((float) w / h > targetAspect) {
+                // Image is wider than 3:4 — crop width
+                cropH = h;
+                cropW = Math.round(h * targetAspect);
+            } else {
+                // Image is taller or equal — crop height
+                cropW = w;
+                cropH = Math.round(w / targetAspect);
+            }
+            int cropX = (w - cropW) / 2;
+            int cropY = (h - cropH) / 2;
+
+            Bitmap cropped = Bitmap.createBitmap(bmp, cropX, cropY, cropW, cropH);
+            bmp.recycle();
+
+            // Rotate 90° CW so the portrait image has H > W
+            Matrix m = new Matrix();
+            m.postRotate(90);
+            Bitmap portrait = Bitmap.createBitmap(cropped,
+                0, 0, cropped.getWidth(), cropped.getHeight(), m, true);
+            cropped.recycle();
+
+            ByteArrayOutputStream bos = new ByteArrayOutputStream();
+            portrait.compress(Bitmap.CompressFormat.JPEG, JPEG_QUALITY, bos);
+            portrait.recycle();
+
+            return new Object[]{bos.toByteArray(), cropX, cropY, cropW, cropH};
+        } catch (Exception e) {
+            Log.e(TAG, "Portrait crop failed", e);
+            return new Object[]{jpegData, 0, 0, 0, 0};
         }
-        return base;
     }
 
     // ================================================================
     // CAPTURE
     // ================================================================
-    private void doCapture(Size jpegSize, boolean maxRes, boolean includeDng) {
-        CameraDevice camera = cameraDevice;
-        if (camera == null) { finishCapture("Camera not available"); return; }
-
+    private void doCapture(Size jpegSize, boolean maxRes, boolean wantDng) {
         ImageReader jpegReader = null;
         ImageReader rawReader = null;
 
         try {
+            setStatusForced("Hold still...");
+
             jpegReader = ImageReader.newInstance(
-                jpegSize.getWidth(), jpegSize.getHeight(), ImageFormat.JPEG, 2);
-
-            if (includeDng && maxResRawSize != null) {
-                rawReader = ImageReader.newInstance(
-                    maxResRawSize.getWidth(), maxResRawSize.getHeight(),
-                    ImageFormat.RAW_SENSOR, 2);
-            }
-
-            List<OutputConfiguration> outputs = new ArrayList<>();
-            OutputConfiguration jpegOut = new OutputConfiguration(jpegReader.getSurface());
-            if (maxRes) {
-                try { jpegOut.getClass().getMethod("setSensorPixelModeUsed", int.class)
-                    .invoke(jpegOut, 1); } catch (Exception ignored) {}
-            }
-            outputs.add(jpegOut);
-
-            OutputConfiguration rawOut = null;
-            if (rawReader != null) {
-                rawOut = new OutputConfiguration(rawReader.getSurface());
-                if (maxRes) {
-                    try { rawOut.getClass().getMethod("setSensorPixelModeUsed", int.class)
-                        .invoke(rawOut, 1); } catch (Exception ignored) {}
-                }
-                outputs.add(rawOut);
-            }
-
-            final Object sessLock = new Object();
-            final int[] sessResult = {-999};
-            final CameraCaptureSession[] sessHolder = new CameraCaptureSession[1];
-            Executor exec = camHandler::post;
-
-            SessionConfiguration sessConfig = new SessionConfiguration(
-                SessionConfiguration.SESSION_REGULAR, outputs, exec,
-                new CameraCaptureSession.StateCallback() {
-                    @Override public void onConfigured(@NonNull CameraCaptureSession session) {
-                        sessHolder[0] = session;
-                        synchronized (sessLock) { sessResult[0] = 0; sessLock.notifyAll(); }
-                    }
-                    @Override public void onConfigureFailed(@NonNull CameraCaptureSession session) {
-                        synchronized (sessLock) { sessResult[0] = -1; sessLock.notifyAll(); }
-                    }
-                });
-
-            if (maxRes) {
-                try {
-                    CaptureRequest.Builder spb =
-                        camera.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE);
-                    CaptureRequest.Key<Integer> spmKey =
-                        new CaptureRequest.Key<>("android.sensor.pixelMode", Integer.class);
-                    spb.set(spmKey, 1);
-                } catch (Exception ignored) {}
-            }
-
-            camera.createCaptureSession(sessConfig);
-            synchronized (sessLock) {
-                if (sessResult[0] == -999) sessLock.wait(30_000);
-            }
-            if (sessResult[0] != 0 || sessHolder[0] == null) {
-                finishCapture("Session config failed");
-                return;
-            }
-
-            CameraCaptureSession session = sessHolder[0];
-
-            // Build capture request
-            CaptureRequest.Builder capBuilder =
-                camera.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE);
-            capBuilder.addTarget(jpegReader.getSurface());
-            if (rawReader != null) capBuilder.addTarget(rawReader.getSurface());
-            capBuilder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON);
-            capBuilder.set(CaptureRequest.CONTROL_AF_MODE,
-                canAF ? CaptureRequest.CONTROL_AF_MODE_AUTO : CaptureRequest.CONTROL_AF_MODE_OFF);
-            capBuilder.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, currentEv);
-            capBuilder.set(CaptureRequest.JPEG_QUALITY, (byte) JPEG_QUALITY);
-
-            // Set JPEG_ORIENTATION to 0 — we pixel-rotate ourselves
-            capBuilder.set(CaptureRequest.JPEG_ORIENTATION, 0);
-
-            if (maxRes) {
-                CaptureRequest.Key<Integer> spmKey =
-                    new CaptureRequest.Key<>("android.sensor.pixelMode", Integer.class);
-                capBuilder.set(spmKey, 1);
-            }
-
-            // Image holders
+                jpegSize.getWidth(), jpegSize.getHeight(), ImageFormat.JPEG, 1);
+            final byte[][] jpegData = {null};
+            final int[][] dims = new int[2][2]; // [0]=jpeg, [1]=raw
             final Object imgLock = new Object();
-            final byte[][] jpegData = new byte[1][];
-            final Image[] rawImage = new Image[1];
-            final int[][] dims = new int[2][2];
-            final TotalCaptureResult[] capResultHolder = new TotalCaptureResult[1];
 
-            jpegReader.setOnImageAvailableListener(r -> {
+            jpegReader.setOnImageAvailableListener(reader -> {
                 Image img = null;
                 try {
-                    img = r.acquireLatestImage();
+                    img = reader.acquireLatestImage();
                     if (img != null) {
-                        dims[0][0] = img.getWidth(); dims[0][1] = img.getHeight();
                         ByteBuffer buf = img.getPlanes()[0].getBuffer();
                         jpegData[0] = new byte[buf.remaining()];
                         buf.get(jpegData[0]);
+                        dims[0][0] = img.getWidth();
+                        dims[0][1] = img.getHeight();
                     }
                 } finally {
                     if (img != null) img.close();
@@ -1197,19 +1154,118 @@ public class MainActivity extends AppCompatActivity {
                 }
             }, camHandler);
 
-            if (rawReader != null) {
-                rawReader.setOnImageAvailableListener(r -> {
-                    Image img = r.acquireLatestImage();
-                    if (img != null) {
-                        dims[1][0] = img.getWidth(); dims[1][1] = img.getHeight();
-                        rawImage[0] = img;
+            final Image[] rawImage = {null};
+            if (wantDng && maxResRawSize != null) {
+                rawReader = ImageReader.newInstance(
+                    maxResRawSize.getWidth(), maxResRawSize.getHeight(),
+                    ImageFormat.RAW_SENSOR, 1);
+                rawReader.setOnImageAvailableListener(reader -> {
+                    rawImage[0] = reader.acquireLatestImage();
+                    if (rawImage[0] != null) {
+                        dims[1][0] = rawImage[0].getWidth();
+                        dims[1][1] = rawImage[0].getHeight();
                     }
                     synchronized (imgLock) { imgLock.notifyAll(); }
                 }, camHandler);
             }
 
+            // Build output configurations
+            List<OutputConfiguration> outputs = new ArrayList<>();
+            OutputConfiguration jpegOutConfig = new OutputConfiguration(jpegReader.getSurface());
+            OutputConfiguration rawOutConfig = null;
+
+            if (maxRes) {
+                try {
+                    jpegOutConfig.getClass().getMethod("setSensorPixelModeUsed", int.class)
+                        .invoke(jpegOutConfig, 1);
+                } catch (Exception e) {
+                    Log.w(TAG, "setSensorPixelModeUsed failed on JPEG output: " + e.getMessage());
+                }
+            }
+            outputs.add(jpegOutConfig);
+
+            if (rawReader != null) {
+                rawOutConfig = new OutputConfiguration(rawReader.getSurface());
+                if (maxRes) {
+                    try {
+                        rawOutConfig.getClass().getMethod("setSensorPixelModeUsed", int.class)
+                            .invoke(rawOutConfig, 1);
+                    } catch (Exception e) {
+                        Log.w(TAG, "setSensorPixelModeUsed failed on RAW output: " + e.getMessage());
+                    }
+                }
+                outputs.add(rawOutConfig);
+            }
+
+            // Create session
+            Executor exec = camHandler::post;
+            final Object sessLock = new Object();
+            final CameraCaptureSession[] sessHolder = {null};
+            final boolean[] sessOk = {false};
+
+            SessionConfiguration sessConfig = new SessionConfiguration(
+                SessionConfiguration.SESSION_REGULAR, outputs, exec,
+                new CameraCaptureSession.StateCallback() {
+                    @Override public void onConfigured(@NonNull CameraCaptureSession session) {
+                        sessHolder[0] = session;
+                        sessOk[0] = true;
+                        synchronized (sessLock) { sessLock.notifyAll(); }
+                    }
+                    @Override public void onConfigureFailed(@NonNull CameraCaptureSession session) {
+                        synchronized (sessLock) { sessLock.notifyAll(); }
+                    }
+                });
+
+            // Set session parameters for max-res
+            if (maxRes) {
+                try {
+                    CaptureRequest.Builder sessParamBuilder =
+                        cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE);
+                    CaptureRequest.Key<Integer> pixelModeKey =
+                        new CaptureRequest.Key<>("android.sensor.pixelMode", Integer.class);
+                    sessParamBuilder.set(pixelModeKey, 1);
+                    sessConfig.setSessionParameters(sessParamBuilder.build());
+                } catch (Exception e) {
+                    Log.w(TAG, "Session params pixelMode failed: " + e.getMessage());
+                }
+            }
+
+            cameraDevice.createCaptureSession(sessConfig);
+            synchronized (sessLock) {
+                if (!sessOk[0]) sessLock.wait(30_000);
+            }
+            if (!sessOk[0]) { finishCapture("Session config failed"); return; }
+
+            CameraCaptureSession session = sessHolder[0];
+
+            // Build capture request
+            CaptureRequest.Builder capBuilder =
+                cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE);
+            capBuilder.addTarget(jpegReader.getSurface());
+            if (rawReader != null) capBuilder.addTarget(rawReader.getSurface());
+
+            capBuilder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON);
+            capBuilder.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, currentEv);
+            capBuilder.set(CaptureRequest.JPEG_QUALITY, (byte) JPEG_QUALITY);
+
+            if (maxRes) {
+                try {
+                    CaptureRequest.Key<Integer> pixelModeKey =
+                        new CaptureRequest.Key<>("android.sensor.pixelMode", Integer.class);
+                    capBuilder.set(pixelModeKey, 1);
+                } catch (Exception e) {
+                    Log.w(TAG, "CaptureRequest pixelMode failed: " + e.getMessage());
+                }
+            }
+
+            // Set JPEG_ORIENTATION to make the sensor output upright
+            int baseRotation = getBaseRotation();
+            capBuilder.set(CaptureRequest.JPEG_ORIENTATION, baseRotation);
+
+            // Fire capture
             final Object capLock = new Object();
             final boolean[] capOk = {false};
+            final TotalCaptureResult[] capResultHolder = {null};
 
             session.capture(capBuilder.build(), new CameraCaptureSession.CaptureCallback() {
                 @Override public void onCaptureCompleted(@NonNull CameraCaptureSession s,
@@ -1249,9 +1305,6 @@ public class MainActivity extends AppCompatActivity {
                 default:   mpLabel = "16MP"; break;
             }
 
-            // Compute rotation using the correct method
-            int totalRotation = getTotalPixelRotation();
-
             StringBuilder receipt = new StringBuilder();
             receipt.append("\u2550\u2550\u2550 CAPTURE RECEIPT \u2550\u2550\u2550\n");
             receipt.append("Time: ").append(
@@ -1259,15 +1312,30 @@ public class MainActivity extends AppCompatActivity {
             receipt.append("Mode: ").append(mpLabel).append(maxRes ? " (MAX-RES)" : " (DEFAULT)").append("\n");
             receipt.append("Orientation: ").append(currentOrient).append("\n");
             receipt.append("sensorOrientation: ").append(sensorOrientation).append("\u00B0\n");
-            receipt.append("baseRotation: ").append(getBaseRotation()).append("\u00B0\n");
-            receipt.append("pixelRotationApplied: ").append(totalRotation).append("\u00B0\n");
+            receipt.append("JPEG_ORIENTATION sent: ").append(baseRotation).append("\u00B0\n");
             receipt.append("EV: ").append((currentEv >= 0 ? "+" : "")).append(currentEv).append("\n");
 
-            // Save JPEG with pixel rotation
+            // Save JPEG
             if (jpegData[0] != null) {
                 setStatusForced("Processing JPEG...");
 
-                byte[] finalJpeg = rotateJpegPixels(jpegData[0], totalRotation);
+                byte[] finalJpeg;
+                boolean isPortrait = (currentOrient == OrientMode.PORTRAIT);
+                int cropX = 0, cropY = 0, cropW = 0, cropH = 0;
+
+                if (isPortrait) {
+                    // The JPEG from the sensor is already rotated upright (landscape, W > H)
+                    // via JPEG_ORIENTATION. Now center-crop to 3:4 and rotate to portrait.
+                    Object[] cropResult = cropToPortrait(jpegData[0]);
+                    finalJpeg = (byte[]) cropResult[0];
+                    cropX = (int) cropResult[1];
+                    cropY = (int) cropResult[2];
+                    cropW = (int) cropResult[3];
+                    cropH = (int) cropResult[4];
+                } else {
+                    // Landscape: use as-is (JPEG_ORIENTATION already made it upright)
+                    finalJpeg = jpegData[0];
+                }
 
                 BitmapFactory.Options opts = new BitmapFactory.Options();
                 opts.inJustDecodeBounds = true;
@@ -1275,28 +1343,52 @@ public class MainActivity extends AppCompatActivity {
                 int dw = opts.outWidth, dh = opts.outHeight;
                 double mp = (long) dw * dh / 1e6;
 
-                // Verify orientation correctness
+                // Auto-correct: verify orientation
                 boolean orientCorrect;
-                if (currentOrient == OrientMode.LANDSCAPE) {
-                    orientCorrect = (dw >= dh); // landscape: width >= height
+                if (isPortrait) {
+                    orientCorrect = (dh >= dw);
+                    if (!orientCorrect) {
+                        // Emergency fix: rotate 90
+                        finalJpeg = rotateJpegPixels(finalJpeg, 90);
+                        opts = new BitmapFactory.Options();
+                        opts.inJustDecodeBounds = true;
+                        BitmapFactory.decodeByteArray(finalJpeg, 0, finalJpeg.length, opts);
+                        dw = opts.outWidth; dh = opts.outHeight;
+                        mp = (long) dw * dh / 1e6;
+                        orientCorrect = (dh >= dw);
+                    }
                 } else {
-                    orientCorrect = (dh >= dw); // portrait: height >= width
+                    orientCorrect = (dw >= dh);
+                    if (!orientCorrect) {
+                        finalJpeg = rotateJpegPixels(finalJpeg, 90);
+                        opts = new BitmapFactory.Options();
+                        opts.inJustDecodeBounds = true;
+                        BitmapFactory.decodeByteArray(finalJpeg, 0, finalJpeg.length, opts);
+                        dw = opts.outWidth; dh = opts.outHeight;
+                        mp = (long) dw * dh / 1e6;
+                        orientCorrect = (dw >= dh);
+                    }
                 }
 
-                String jname = "FlashCam_" + ts + "_" + mpLabel + ".jpg";
-                File savedFile = saveToGallery(finalJpeg, jname, "image/jpeg");
+                String orientSuffix = isPortrait ? "_port" : "_land";
+                String jname = "FlashCam_" + ts + "_" + mpLabel + orientSuffix + ".jpg";
+                File savedFile = saveToMediaStore(finalJpeg, jname, "image/jpeg");
 
                 receipt.append("\u2500\u2500 JPEG \u2500\u2500\n");
                 receipt.append("Requested: ").append(jpegSize.getWidth()).append("x")
                     .append(jpegSize.getHeight()).append("\n");
-                receipt.append("Actual (after rotation): ").append(dw).append("x").append(dh)
+                if (isPortrait) {
+                    receipt.append("Crop: center ").append(cropW).append("x").append(cropH)
+                        .append(" from (").append(cropX).append(",").append(cropY).append(")\n");
+                    receipt.append("Then rotated 90\u00B0 CW to portrait\n");
+                }
+                receipt.append("Actual saved: ").append(dw).append("x").append(dh)
                     .append(" (").append(String.format(Locale.US, "%.1f", mp)).append(" MP)\n");
                 receipt.append("Orientation correct: ").append(orientCorrect ? "YES" : "NO (MISMATCH!)").append("\n");
                 receipt.append("File: ").append(savedFile != null ? savedFile.getAbsolutePath() : "SAVE FAILED").append("\n");
                 receipt.append("Size: ").append(savedFile != null ?
                     String.format(Locale.US, "%,d bytes (%.2f MB)", savedFile.length(),
                         savedFile.length() / 1048576.0) : "?").append("\n");
-                receipt.append("exifOrientationWritten: NORMAL (pixels rotated)\n");
 
                 // Write EXIF
                 if (savedFile != null) {
@@ -1306,7 +1398,7 @@ public class MainActivity extends AppCompatActivity {
                             String.valueOf(ExifInterface.ORIENTATION_NORMAL));
                         exif.setAttribute(ExifInterface.TAG_MAKE, "INMO");
                         exif.setAttribute(ExifInterface.TAG_MODEL, "Air3 IMA301");
-                        exif.setAttribute(ExifInterface.TAG_SOFTWARE, "FlashCam-Air3 v1.4");
+                        exif.setAttribute(ExifInterface.TAG_SOFTWARE, "FlashCam-Air3 v1.5");
                         exif.saveAttributes();
                     } catch (Exception ignored) {}
                 }
@@ -1328,17 +1420,31 @@ public class MainActivity extends AppCompatActivity {
                 String dname = "FlashCam_" + ts + "_" + mpLabel + ".dng";
                 try {
                     DngCreator dngCreator = new DngCreator(camChars, capResultHolder[0]);
-                    dngCreator.setDescription("FlashCam-Air3 v1.4");
-                    // Set DNG orientation based on total rotation
-                    int dngOrientation = ExifInterface.ORIENTATION_NORMAL;
-                    switch (totalRotation) {
-                        case 90:  dngOrientation = ExifInterface.ORIENTATION_ROTATE_90; break;
-                        case 180: dngOrientation = ExifInterface.ORIENTATION_ROTATE_180; break;
-                        case 270: dngOrientation = ExifInterface.ORIENTATION_ROTATE_270; break;
-                    }
-                    dngCreator.setOrientation(dngOrientation);
+                    dngCreator.setDescription("FlashCam-Air3 v1.5 Max-Res");
 
-                    File dngFile = saveDngToGallery(dngCreator, rawImage[0], dname);
+                    // DNG orientation: for landscape, set based on baseRotation.
+                    // For portrait, the DNG is the raw sensor data — set orientation tag.
+                    int dngExifOrientation;
+                    if (currentOrient == OrientMode.PORTRAIT) {
+                        // Raw data is unrotated sensor output. Tag tells viewers how to rotate.
+                        int combined = (baseRotation + 90) % 360;
+                        switch (combined) {
+                            case 90:  dngExifOrientation = ExifInterface.ORIENTATION_ROTATE_90; break;
+                            case 180: dngExifOrientation = ExifInterface.ORIENTATION_ROTATE_180; break;
+                            case 270: dngExifOrientation = ExifInterface.ORIENTATION_ROTATE_270; break;
+                            default:  dngExifOrientation = ExifInterface.ORIENTATION_NORMAL; break;
+                        }
+                    } else {
+                        switch (baseRotation) {
+                            case 90:  dngExifOrientation = ExifInterface.ORIENTATION_ROTATE_90; break;
+                            case 180: dngExifOrientation = ExifInterface.ORIENTATION_ROTATE_180; break;
+                            case 270: dngExifOrientation = ExifInterface.ORIENTATION_ROTATE_270; break;
+                            default:  dngExifOrientation = ExifInterface.ORIENTATION_NORMAL; break;
+                        }
+                    }
+                    dngCreator.setOrientation(dngExifOrientation);
+
+                    File dngFile = saveDngToMediaStore(dngCreator, rawImage[0], dname);
 
                     receipt.append("\u2500\u2500 DNG \u2500\u2500\n");
                     receipt.append("Actual: ").append(dims[1][0]).append("x").append(dims[1][1]).append("\n");
@@ -1346,7 +1452,7 @@ public class MainActivity extends AppCompatActivity {
                     receipt.append("Size: ").append(dngFile != null ?
                         String.format(Locale.US, "%,d bytes (%.2f MB)", dngFile.length(),
                             dngFile.length() / 1048576.0) : "?").append("\n");
-                    receipt.append("DNG orientation tag: ").append(totalRotation).append("\u00B0\n");
+                    receipt.append("DNG orientation tag: ").append(dngExifOrientation).append("\n");
 
                     dngCreator.close();
                 } catch (Exception dngErr) {
@@ -1442,7 +1548,7 @@ public class MainActivity extends AppCompatActivity {
                 mediaRecorder.setAudioEncodingBitRate(128_000);
                 mediaRecorder.setAudioSamplingRate(44100);
 
-                // Orientation hint
+                // Orientation hint for video
                 int orientHint = getBaseRotation();
                 if (currentOrient == OrientMode.PORTRAIT) {
                     orientHint = (orientHint + 90) % 360;
@@ -1470,12 +1576,12 @@ public class MainActivity extends AppCompatActivity {
                     new OutputConfiguration(recorderSurface)
                 );
 
-                Executor exec = camHandler::post;
+                Executor vidExec = camHandler::post;
                 final Object sessLock = new Object();
                 final int[] sessResult = {-999};
 
-                SessionConfiguration sessConfig = new SessionConfiguration(
-                    SessionConfiguration.SESSION_REGULAR, outputs, exec,
+                SessionConfiguration vidSessConfig = new SessionConfiguration(
+                    SessionConfiguration.SESSION_REGULAR, outputs, vidExec,
                     new CameraCaptureSession.StateCallback() {
                         @Override public void onConfigured(@NonNull CameraCaptureSession session) {
                             previewSession = session;
@@ -1486,7 +1592,7 @@ public class MainActivity extends AppCompatActivity {
                         }
                     });
 
-                cameraDevice.createCaptureSession(sessConfig);
+                cameraDevice.createCaptureSession(vidSessConfig);
                 synchronized (sessLock) {
                     if (sessResult[0] == -999) sessLock.wait(30_000);
                 }
@@ -1533,6 +1639,7 @@ public class MainActivity extends AppCompatActivity {
                     chronoRec.stop();
                     chronoRec.setVisibility(View.GONE);
                     tvRecTimer.setVisibility(View.GONE);
+                    btnShutter.setBackground(getDrawable(R.drawable.shutter_button));
                 });
 
                 if (currentVideoPath != null) {
@@ -1540,7 +1647,7 @@ public class MainActivity extends AppCompatActivity {
                         new String[]{currentVideoPath}, new String[]{"video/mp4"}, null);
                 }
 
-                setStatusForced("Video saved: " + currentVideoPath);
+                setStatusForced("Video saved!");
 
                 if (debugEnabled) {
                     File vf = new File(currentVideoPath);
@@ -1566,22 +1673,52 @@ public class MainActivity extends AppCompatActivity {
     }
 
     // ================================================================
-    // GALLERY SAVING (MediaStore)
+    // MEDIASTORE SAVING (scoped storage safe)
     // ================================================================
-    private File saveToGallery(byte[] data, String filename, String mimeType) {
+    private File saveToMediaStore(byte[] data, String filename, String mimeType) {
+        // Try MediaStore first (scoped storage safe)
+        if (Build.VERSION.SDK_INT >= 29) {
+            try {
+                ContentValues values = new ContentValues();
+                values.put(MediaStore.Images.Media.DISPLAY_NAME, filename);
+                values.put(MediaStore.Images.Media.MIME_TYPE, mimeType);
+                values.put(MediaStore.Images.Media.RELATIVE_PATH,
+                    Environment.DIRECTORY_PICTURES + "/FlashCam-Air3");
+                values.put(MediaStore.Images.Media.IS_PENDING, 1);
+
+                Uri uri = getContentResolver().insert(
+                    MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values);
+                if (uri != null) {
+                    OutputStream out = getContentResolver().openOutputStream(uri);
+                    if (out != null) {
+                        out.write(data);
+                        out.close();
+                    }
+                    values.clear();
+                    values.put(MediaStore.Images.Media.IS_PENDING, 0);
+                    getContentResolver().update(uri, values, null, null);
+
+                    // Return a File reference for receipt (path may not be directly accessible)
+                    File dir = new File(Environment.getExternalStoragePublicDirectory(
+                        Environment.DIRECTORY_PICTURES), "FlashCam-Air3");
+                    return new File(dir, filename);
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "MediaStore save failed, falling back: " + e.getMessage());
+            }
+        }
+
+        // Fallback: direct file write
         try {
             File dir = new File(Environment.getExternalStoragePublicDirectory(
                 Environment.DIRECTORY_PICTURES), "FlashCam-Air3");
             if (!dir.exists()) dir.mkdirs();
             File file = new File(dir, filename);
-
             FileOutputStream fos = new FileOutputStream(file);
             fos.write(data);
             fos.close();
-
             MediaScannerConnection.scanFile(this,
                 new String[]{file.getAbsolutePath()}, new String[]{mimeType}, null);
-
             return file;
         } catch (Exception e) {
             setStatusForced("Save error: " + e.getMessage());
@@ -1589,20 +1726,48 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    private File saveDngToGallery(DngCreator dngCreator, Image rawImage, String filename) {
+    private File saveDngToMediaStore(DngCreator dngCreator, Image rawImage, String filename) {
+        if (Build.VERSION.SDK_INT >= 29) {
+            try {
+                ContentValues values = new ContentValues();
+                values.put(MediaStore.Images.Media.DISPLAY_NAME, filename);
+                values.put(MediaStore.Images.Media.MIME_TYPE, "image/x-adobe-dng");
+                values.put(MediaStore.Images.Media.RELATIVE_PATH,
+                    Environment.DIRECTORY_PICTURES + "/FlashCam-Air3");
+                values.put(MediaStore.Images.Media.IS_PENDING, 1);
+
+                Uri uri = getContentResolver().insert(
+                    MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values);
+                if (uri != null) {
+                    OutputStream out = getContentResolver().openOutputStream(uri);
+                    if (out != null) {
+                        dngCreator.writeImage(out, rawImage);
+                        out.close();
+                    }
+                    values.clear();
+                    values.put(MediaStore.Images.Media.IS_PENDING, 0);
+                    getContentResolver().update(uri, values, null, null);
+
+                    File dir = new File(Environment.getExternalStoragePublicDirectory(
+                        Environment.DIRECTORY_PICTURES), "FlashCam-Air3");
+                    return new File(dir, filename);
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "MediaStore DNG save failed, falling back: " + e.getMessage());
+            }
+        }
+
+        // Fallback
         try {
             File dir = new File(Environment.getExternalStoragePublicDirectory(
                 Environment.DIRECTORY_PICTURES), "FlashCam-Air3");
             if (!dir.exists()) dir.mkdirs();
             File file = new File(dir, filename);
-
             OutputStream out = new FileOutputStream(file);
             dngCreator.writeImage(out, rawImage);
             out.close();
-
             MediaScannerConnection.scanFile(this,
                 new String[]{file.getAbsolutePath()}, new String[]{"image/x-adobe-dng"}, null);
-
             return file;
         } catch (Exception e) {
             setStatusForced("DNG save error: " + e.getMessage());
@@ -1637,7 +1802,7 @@ public class MainActivity extends AppCompatActivity {
                 if (!dir.exists()) dir.mkdirs();
                 File f = new File(dir, "flashcam_log.txt");
                 FileWriter w = new FileWriter(f, false);
-                w.write("FlashCam-Air3 v1.4 Log \u2014 " + receiptLog.size() + " captures\n");
+                w.write("FlashCam-Air3 v1.5 Log \u2014 " + receiptLog.size() + " captures\n");
                 w.write("Exported: " + new SimpleDateFormat("yyyy-MM-dd HH:mm:ss",
                     Locale.US).format(new Date()) + "\n\n");
                 for (String r : receiptLog) { w.write(r); w.write("\n"); }
