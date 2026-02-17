@@ -1,7 +1,6 @@
 package com.flashcam.air3;
 
 import android.Manifest;
-import android.animation.ValueAnimator;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.ContentValues;
@@ -73,17 +72,15 @@ public class MainActivity extends AppCompatActivity {
     private static final int PERM_CODE = 100;
     private static final int COLOR_ORANGE = 0xFFFF6600;
     private static final int COLOR_RED = 0xFFFF0000;
-    private static final String APP_VERSION = "1.5.1";
+    private static final String APP_VERSION = "1.6.0";
 
     // ── Enums ──
     enum MpMode { MP8, MP12, MP16 }
-    enum OrientMode { LANDSCAPE, PORTRAIT }
     enum VideoMode { V1080, V4K }
     enum CamState { INIT, OPENING, PREVIEW, CAPTURING, RECORDING, ERROR }
 
     // ── State ──
     private MpMode currentMp = MpMode.MP16;
-    private OrientMode currentOrient = OrientMode.LANDSCAPE;
     private VideoMode currentVideo = VideoMode.V1080;
     private boolean dngEnabled = false;
     private boolean debugEnabled = false;
@@ -117,13 +114,12 @@ public class MainActivity extends AppCompatActivity {
 
     // ── UI ──
     private TextureView textureView;
-    private CaptureFrameOverlayView captureFrameOverlay;
     private View shutterFlashOverlay;
     private View focusRing;
     private TextView tvStatus, tvMode, tvFocusIndicator, tvEv, tvRecTimer;
     private TextView tvReceipt;
     private ImageButton btnShutter;
-    private Button btnMode, btnDng, btnVideo, btnOrientation, btnDebug, btnCredits;
+    private Button btnMode, btnDng, btnVideo, btnDebug, btnCredits;
     private Button btnEvPlus, btnEvMinus;
     private Button btnCopyReceipt, btnExportLog, btnDismiss;
     private LinearLayout receiptPanel;
@@ -193,7 +189,6 @@ public class MainActivity extends AppCompatActivity {
     // ================================================================
     private void bindViews() {
         textureView = findViewById(R.id.textureView);
-        captureFrameOverlay = findViewById(R.id.captureFrameOverlay);
         shutterFlashOverlay = findViewById(R.id.shutterFlashOverlay);
         focusRing = findViewById(R.id.focusRing);
         tvStatus = findViewById(R.id.tvStatus);
@@ -206,7 +201,6 @@ public class MainActivity extends AppCompatActivity {
         btnMode = findViewById(R.id.btnMode);
         btnDng = findViewById(R.id.btnDng);
         btnVideo = findViewById(R.id.btnVideo);
-        btnOrientation = findViewById(R.id.btnOrientation);
         btnDebug = findViewById(R.id.btnDebug);
         btnCredits = findViewById(R.id.btnCredits);
         btnEvPlus = findViewById(R.id.btnEvPlus);
@@ -231,19 +225,10 @@ public class MainActivity extends AppCompatActivity {
             @Override public void onSurfaceTextureUpdated(@NonNull SurfaceTexture st) {}
         });
 
-        // Tap-to-focus (crop-aware)
+        // Tap-to-focus (full-frame, no crop filtering)
         textureView.setOnTouchListener((v, event) -> {
             if (event.getAction() == android.view.MotionEvent.ACTION_DOWN && previewSession != null && !capturing) {
-                float tx = event.getX(), ty = event.getY();
-
-                // If portrait overlay is active, only accept taps inside the clearRect
-                if (currentOrient == OrientMode.PORTRAIT && captureFrameOverlay != null) {
-                    if (!captureFrameOverlay.isInsideClearRect(tx, ty)) {
-                        return true; // consume but ignore
-                    }
-                }
-
-                handleTapToFocus(tx, ty);
+                handleTapToFocus(event.getX(), event.getY());
             }
             return true;
         });
@@ -285,14 +270,6 @@ public class MainActivity extends AppCompatActivity {
                 videoMode ? COLOR_RED : 0xFF333333));
             btnShutter.setBackground(getDrawable(
                 videoMode ? R.drawable.record_button : R.drawable.shutter_button));
-        });
-
-        btnOrientation.setOnClickListener(v -> {
-            currentOrient = (currentOrient == OrientMode.LANDSCAPE) ?
-                OrientMode.PORTRAIT : OrientMode.LANDSCAPE;
-            btnOrientation.setText(currentOrient == OrientMode.LANDSCAPE ? "LAND" : "PORT");
-            updateModeDisplay();
-            updateCaptureFrameOverlay();
         });
 
         btnEvPlus.setOnClickListener(v -> adjustEv(1));
@@ -557,7 +534,6 @@ public class MainActivity extends AppCompatActivity {
             mainHandler.post(() -> {
                 btnShutter.setEnabled(true);
                 configurePreviewTransform(textureView.getWidth(), textureView.getHeight());
-                updateCaptureFrameOverlay();
                 updateModeDisplay();
             });
 
@@ -568,27 +544,19 @@ public class MainActivity extends AppCompatActivity {
     }
 
     // ================================================================
-    // PREVIEW TRANSFORM (LETTERBOX, NO DISTORTION)
+    // SHARED ROTATION HELPER
     // ================================================================
-    private void configurePreviewTransform(int viewWidth, int viewHeight) {
-        if (previewSize == null || viewWidth == 0 || viewHeight == 0) return;
 
-        // The preview buffer is always in sensor orientation (landscape).
-        // On the Air3, sensorOrientation is typically 270 or 90.
-        // The TextureView shows the buffer; we need to:
-        // 1. Rotate to match display orientation
-        // 2. Scale uniformly to FIT (letterbox)
-
-        int pw = previewSize.getWidth();  // e.g., 1440
-        int ph = previewSize.getHeight(); // e.g., 1080
-
-        Matrix matrix = new Matrix();
-
-        // Center the preview in the view
-        float centerX = viewWidth / 2f;
-        float centerY = viewHeight / 2f;
-
-        // The display rotation for the Air3 (landscape device) is typically 0
+    /**
+     * Rotation needed to map sensor buffer → display upright (Air3 landscape-locked).
+     *
+     * IMPORTANT: This uses the INVERSE formula (degrees - sensorOrientation)
+     * which is the correct mapping for a landscape-locked device where the
+     * sensor is mounted at 270°.
+     *
+     * Used for: preview transform, JPEG pixel rotation, video orientation hint.
+     */
+    private int getDisplayUprightRotationDegrees() {
         int deviceRotation = getWindowManager().getDefaultDisplay().getRotation();
         int degrees = 0;
         switch (deviceRotation) {
@@ -597,173 +565,92 @@ public class MainActivity extends AppCompatActivity {
             case Surface.ROTATION_180: degrees = 180; break;
             case Surface.ROTATION_270: degrees = 270; break;
         }
+        // NOTE: IMPORTANT sign flip vs v1.5.1 code
+        return (degrees - sensorOrientation + 360) % 360;
+    }
 
-        // Determine if we need to swap dimensions after rotation
-        int rotationToApply = (sensorOrientation - degrees + 360) % 360;
-        boolean swapDims = (rotationToApply == 90 || rotationToApply == 270);
+    // ================================================================
+    // PREVIEW TRANSFORM (LETTERBOX, NO DISTORTION)
+    // ================================================================
 
-        float bufferWidth = swapDims ? ph : pw;
-        float bufferHeight = swapDims ? pw : ph;
+    /**
+     * Simple, deterministic preview transform:
+     * 1. Map buffer rect → view rect using RectToRect CENTER (uniform fit)
+     * 2. Rotate by getDisplayUprightRotationDegrees() around view center
+     *
+     * No multi-branch hacks. The preview shows the full 4:3 sensor frame
+     * letterboxed inside the landscape UI.
+     */
+    private void configurePreviewTransform(int viewWidth, int viewHeight) {
+        if (previewSize == null || viewWidth == 0 || viewHeight == 0) return;
 
-        // Uniform scale to FIT inside the view (letterbox)
-        float scaleX = viewWidth / bufferWidth;
-        float scaleY = viewHeight / bufferHeight;
-        float uniformScale = Math.min(scaleX, scaleY);
+        int pw = previewSize.getWidth();  // e.g., 1440
+        int ph = previewSize.getHeight(); // e.g., 1080
 
-        // Build transform: translate to origin, scale, rotate, translate back
-        RectF viewRect = new RectF(0, 0, viewWidth, viewHeight);
+        float centerX = viewWidth / 2f;
+        float centerY = viewHeight / 2f;
+
+        int rotation = getDisplayUprightRotationDegrees();
+        boolean swapDims = (rotation == 90 || rotation == 270);
+
+        // After rotation, the buffer appears as these dimensions
+        float rotatedW = swapDims ? ph : pw;
+        float rotatedH = swapDims ? pw : ph;
+
+        // Build the transform matrix
+        Matrix matrix = new Matrix();
+
+        // The TextureView by default stretches the buffer (pw x ph) to fill (viewWidth x viewHeight).
+        // We need to:
+        // 1. Undo that default stretch
+        // 2. Apply rotation
+        // 3. Apply uniform scale to FIT
+
+        // Step 1: Undo default stretch by scaling buffer back to its natural size
+        // Default maps: pw → viewWidth, ph → viewHeight
+        // So undo: scaleX = pw/viewWidth, scaleY = ph/viewHeight
+        // Then apply rotation, then scale to fit.
+
+        // Simpler approach: work in buffer coordinates
         RectF bufferRect = new RectF(0, 0, pw, ph);
+        RectF viewRect = new RectF(0, 0, viewWidth, viewHeight);
 
-        // Center buffer in view
-        float bufCenterX = bufferRect.centerX();
-        float bufCenterY = bufferRect.centerY();
+        // After rotation, the effective buffer rect is rotatedW x rotatedH
+        RectF rotatedBufferRect = new RectF(0, 0, rotatedW, rotatedH);
 
-        // Step 1: Move buffer center to view center
-        matrix.setTranslate(centerX - bufCenterX, centerY - bufCenterY);
+        // Compute uniform fit scale from rotated buffer to view
+        float fitScaleX = viewWidth / rotatedW;
+        float fitScaleY = viewHeight / rotatedH;
+        float fitScale = Math.min(fitScaleX, fitScaleY);
 
-        // Step 2: Rotate around view center
-        matrix.postRotate(rotationToApply, centerX, centerY);
+        // The TextureView default stretches pw→viewWidth and ph→viewHeight.
+        // We need to undo that and apply our own transform.
+        // Effective: for each axis, the net scale should be fitScale * (rotated dimension / original dimension after rotation)
 
-        // Step 3: After rotation, the buffer occupies bufferWidth x bufferHeight centered at view center.
-        // Scale uniformly to fit.
-        float scaledW = bufferWidth * 1f; // after rotation, the visible dimensions
-        float scaledH = bufferHeight * 1f;
-        // But the TextureView is viewWidth x viewHeight, and the buffer is pw x ph.
-        // After rotation by rotationToApply, the buffer appears as bufferWidth x bufferHeight.
-        // We need to scale from (pw x ph) to fit (viewWidth x viewHeight) considering rotation.
+        // Clean approach: translate to center, undo stretch, rotate, apply fit scale
+        matrix.setTranslate(-centerX, -centerY);
 
-        // Simpler approach: compute scale from the rotated buffer size to view size
-        float postRotW = swapDims ? ph : pw;
-        float postRotH = swapDims ? pw : ph;
-        float fitScale = Math.min((float) viewWidth / postRotW, (float) viewHeight / postRotH);
+        // Undo the default stretch: the texture maps pw to viewWidth, ph to viewHeight
+        // So the current scale is viewWidth/pw in X and viewHeight/ph in Y
+        // We want the final to be fitScale (uniform) after rotation
+        // Undo stretch: multiply by pw/viewWidth in X, ph/viewHeight in Y
+        matrix.postScale((float) pw / viewWidth, (float) ph / viewHeight);
 
-        // The TextureView maps pw x ph to viewWidth x viewHeight by default (stretch).
-        // We need to undo that stretch and apply uniform fit scale.
-        float defaultScaleX = (float) viewWidth / pw;
-        float defaultScaleY = (float) viewHeight / ph;
+        // Now we're in buffer pixel coordinates centered at origin
+        // Apply rotation
+        matrix.postRotate(rotation);
 
-        // Undo default stretch, apply rotation, apply uniform fit
-        matrix.reset();
+        // Now apply uniform fit scale
+        matrix.postScale(fitScale, fitScale);
 
-        // Approach: use RectF mapping
-        // After rotation, the buffer rect maps to a rotated rect.
-        // We want to fit that into the view rect uniformly.
-
-        // Simple and correct approach for Camera2 TextureView:
-        matrix.reset();
-
-        if (rotationToApply != 0) {
-            // Move to center, rotate, move back
-            matrix.postTranslate(-centerX, -centerY);
-            matrix.postRotate(rotationToApply);
-            matrix.postTranslate(centerX, centerY);
-        }
-
-        // After rotation, the texture (which fills viewWidth x viewHeight by default)
-        // has its content rotated. We need to scale to correct aspect ratio.
-        // The default mapping stretches pw -> viewWidth and ph -> viewHeight.
-        // After rotation by 90/270, the visible content is ph wide and pw tall.
-        // But it's displayed in viewWidth x viewHeight.
-        // To get correct aspect: scale x by (viewWidth/ph) * (ph/viewWidth) ... no.
-
-        // Let's use the standard Camera2 TextureView transform:
-        if (swapDims) {
-            // Content is rotated 90/270: visible is ph x pw in a viewWidth x viewHeight container
-            // Default stretch: ph -> viewWidth (scaleX = viewWidth/ph), pw -> viewHeight (scaleY = viewHeight/pw)
-            // But we want uniform scale. The content aspect is ph:pw.
-            float contentAspect = (float) ph / pw;
-            float viewAspect = (float) viewWidth / viewHeight;
-
-            if (contentAspect > viewAspect) {
-                // Content is wider than view: fit width, letterbox top/bottom
-                float scale = (float) viewWidth / viewHeight * (float) pw / ph;
-                matrix.reset();
-                matrix.postScale(1f, scale, centerX, centerY);
-                matrix.postRotate(rotationToApply, centerX, centerY);
-            } else {
-                // Content is taller: fit height, pillarbox left/right
-                float scale = (float) viewHeight / viewWidth * (float) ph / pw;
-                matrix.reset();
-                matrix.postScale(scale, 1f, centerX, centerY);
-                matrix.postRotate(rotationToApply, centerX, centerY);
-            }
-        } else {
-            // Content is 0/180 rotation: visible is pw x ph
-            float contentAspect = (float) pw / ph;
-            float viewAspect = (float) viewWidth / viewHeight;
-
-            if (contentAspect > viewAspect) {
-                // Fit width
-                float scale = (float) viewWidth / viewHeight * (float) ph / pw;
-                matrix.reset();
-                matrix.postScale(1f, scale, centerX, centerY);
-            } else {
-                // Fit height
-                float scale = (float) viewHeight / viewWidth * (float) pw / ph;
-                matrix.reset();
-                matrix.postScale(scale, 1f, centerX, centerY);
-            }
-            if (rotationToApply == 180) {
-                matrix.postRotate(180, centerX, centerY);
-            }
-        }
+        // Translate back to view center
+        matrix.postTranslate(centerX, centerY);
 
         textureView.setTransform(matrix);
     }
 
     // ================================================================
-    // CAPTURE FRAME OVERLAY
-    // ================================================================
-    private void updateCaptureFrameOverlay() {
-        if (captureFrameOverlay == null) return;
-
-        if (currentOrient == OrientMode.LANDSCAPE) {
-            captureFrameOverlay.hideOverlay();
-            return;
-        }
-
-        // Portrait mode: show 3:4 crop area centered in the preview
-        int vw = textureView.getWidth();
-        int vh = textureView.getHeight();
-        if (vw == 0 || vh == 0) return;
-
-        // The preview shows a 4:3 image (letterboxed). Find the actual preview area.
-        float previewAspect = 4f / 3f; // sensor is 4:3
-        float viewAspect = (float) vw / vh;
-
-        float previewLeft, previewTop, previewRight, previewBottom;
-        if (viewAspect > previewAspect) {
-            // View is wider: pillarbox
-            float previewW = vh * previewAspect;
-            previewLeft = (vw - previewW) / 2f;
-            previewRight = previewLeft + previewW;
-            previewTop = 0;
-            previewBottom = vh;
-        } else {
-            // View is taller: letterbox
-            float previewH = vw / previewAspect;
-            previewTop = (vh - previewH) / 2f;
-            previewBottom = previewTop + previewH;
-            previewLeft = 0;
-            previewRight = vw;
-        }
-
-        float previewW = previewRight - previewLeft;
-        float previewH = previewBottom - previewTop;
-
-        // 3:4 crop within the 4:3 preview area
-        // In the 4:3 frame, a 3:4 crop means: cropWidth = previewH * (3/4), centered horizontally
-        float cropW = previewH * 3f / 4f;
-        float cropH = previewH;
-        float cropLeft = previewLeft + (previewW - cropW) / 2f;
-        float cropTop = previewTop;
-
-        captureFrameOverlay.setClearRect(new RectF(cropLeft, cropTop,
-            cropLeft + cropW, cropTop + cropH));
-    }
-
-    // ================================================================
-    // TAP-TO-FOCUS (CROP-AWARE)
+    // TAP-TO-FOCUS
     // ================================================================
     private void handleTapToFocus(float tx, float ty) {
         if (previewSession == null || cameraDevice == null || camChars == null) return;
@@ -783,21 +670,8 @@ public class MainActivity extends AppCompatActivity {
         int vh = textureView.getHeight();
         if (vw == 0 || vh == 0) return;
 
-        // Normalize within the view
-        float nx, ny;
-        if (currentOrient == OrientMode.PORTRAIT && captureFrameOverlay != null) {
-            RectF cr = captureFrameOverlay.getClearRect();
-            if (cr.width() > 0 && cr.height() > 0) {
-                nx = Math.max(0f, Math.min(1f, (tx - cr.left) / cr.width()));
-                ny = Math.max(0f, Math.min(1f, (ty - cr.top) / cr.height()));
-            } else {
-                nx = tx / vw;
-                ny = ty / vh;
-            }
-        } else {
-            nx = tx / vw;
-            ny = ty / vh;
-        }
+        float nx = tx / vw;
+        float ny = ty / vh;
 
         // Map to sensor active array
         android.graphics.Rect activeArray = camChars.get(
@@ -840,25 +714,8 @@ public class MainActivity extends AppCompatActivity {
     }
 
     // ================================================================
-    // ORIENTATION: DETERMINISTIC PIXEL ROTATION
+    // JPEG PIXEL ROTATION
     // ================================================================
-
-    /**
-     * Compute the rotation degrees needed to make the sensor output upright
-     * for the current display orientation.
-     * For a rear camera: rotation = (sensorOrientation - displayRotation + 360) % 360
-     */
-    private int getUprightRotationDegrees() {
-        int deviceRotation = getWindowManager().getDefaultDisplay().getRotation();
-        int degrees = 0;
-        switch (deviceRotation) {
-            case Surface.ROTATION_0:   degrees = 0;   break;
-            case Surface.ROTATION_90:  degrees = 90;  break;
-            case Surface.ROTATION_180: degrees = 180; break;
-            case Surface.ROTATION_270: degrees = 270; break;
-        }
-        return (sensorOrientation - degrees + 360) % 360;
-    }
 
     /**
      * Rotate a JPEG byte array by the given degrees (must be 0, 90, 180, 270).
@@ -876,50 +733,6 @@ public class MainActivity extends AppCompatActivity {
         src.recycle();
         rotated.recycle();
         return bos.toByteArray();
-    }
-
-    /**
-     * Center-crop a landscape JPEG to 3:4 aspect, then rotate 90° CW to produce portrait.
-     * Returns: Object[] { byte[] finalJpeg, int cropX, int cropY, int cropW, int cropH }
-     */
-    private Object[] cropToPortrait(byte[] jpegData) {
-        Bitmap src = BitmapFactory.decodeByteArray(jpegData, 0, jpegData.length);
-        if (src == null) return new Object[]{jpegData, 0, 0, 0, 0};
-
-        int sw = src.getWidth(), sh = src.getHeight();
-
-        // Ensure landscape first (W > H)
-        if (sh > sw) {
-            Matrix rm = new Matrix();
-            rm.postRotate(90);
-            src = Bitmap.createBitmap(src, 0, 0, sw, sh, rm, true);
-            sw = src.getWidth();
-            sh = src.getHeight();
-        }
-
-        // Center crop to 3:4 from the landscape frame
-        // 3:4 means cropW/cropH = 3/4, so cropW = sh * 3/4
-        int cropH = sh;
-        int cropW = (int) (sh * 3.0 / 4.0);
-        if (cropW > sw) { cropW = sw; cropH = (int) (sw * 4.0 / 3.0); }
-        int cropX = (sw - cropW) / 2;
-        int cropY = (sh - cropH) / 2;
-
-        Bitmap cropped = Bitmap.createBitmap(src, cropX, cropY, cropW, cropH);
-
-        // Rotate 90° CW to make portrait (H > W)
-        Matrix m = new Matrix();
-        m.postRotate(90);
-        Bitmap portrait = Bitmap.createBitmap(cropped, 0, 0, cropW, cropH, m, true);
-
-        ByteArrayOutputStream bos = new ByteArrayOutputStream();
-        portrait.compress(Bitmap.CompressFormat.JPEG, 100, bos);
-
-        src.recycle();
-        cropped.recycle();
-        portrait.recycle();
-
-        return new Object[]{bos.toByteArray(), cropX, cropY, cropW, cropH};
     }
 
     // ================================================================
@@ -1025,7 +838,6 @@ public class MainActivity extends AppCompatActivity {
                 new CameraCaptureSession.StateCallback() {
                     @Override public void onConfigured(@NonNull CameraCaptureSession session) {
                         synchronized (sessLock) { sessResult[0] = 0; sessLock.notifyAll(); }
-                        // Store temporarily
                         previewSession = session;
                     }
                     @Override public void onConfigureFailed(@NonNull CameraCaptureSession session) {
@@ -1070,7 +882,6 @@ public class MainActivity extends AppCompatActivity {
             capBuilder.set(CaptureRequest.CONTROL_AF_MODE,
                 CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE);
             capBuilder.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, currentEv);
-            capBuilder.set(CaptureRequest.JPEG_QUALITY, (byte) 100);
 
             // CRITICAL: Set JPEG_ORIENTATION to 0 — we do pixel rotation in software
             capBuilder.set(CaptureRequest.JPEG_ORIENTATION, 0);
@@ -1129,16 +940,15 @@ public class MainActivity extends AppCompatActivity {
                 default:   mpLabel = "16MP"; break;
             }
 
-            int uprightDeg = getUprightRotationDegrees();
+            int uprightDeg = getDisplayUprightRotationDegrees();
 
             StringBuilder receipt = new StringBuilder();
             receipt.append("\u2550\u2550\u2550 CAPTURE RECEIPT \u2550\u2550\u2550\n");
             receipt.append("Time: ").append(
                 new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(new Date())).append("\n");
             receipt.append("Mode: ").append(mpLabel).append(maxRes ? " (MAX-RES)" : " (DEFAULT)").append("\n");
-            receipt.append("Orientation: ").append(currentOrient).append("\n");
             receipt.append("sensorOrientation: ").append(sensorOrientation).append("\u00B0\n");
-            receipt.append("Upright rotation: ").append(uprightDeg).append("\u00B0\n");
+            receipt.append("Display upright rotation: ").append(uprightDeg).append("\u00B0\n");
             receipt.append("JPEG_ORIENTATION sent: 0\u00B0 (pixel rotation in software)\n");
             receipt.append("EV: ").append((currentEv >= 0 ? "+" : "")).append(currentEv).append("\n");
 
@@ -1146,34 +956,8 @@ public class MainActivity extends AppCompatActivity {
             if (jpegData[0] != null) {
                 setStatusForced("Processing JPEG...");
 
-                // Step 1: Rotate to upright landscape
-                byte[] uprightJpeg = rotateJpegPixels(jpegData[0], uprightDeg);
-
-                // Step 1b: Sanity check — verify W > H for landscape
-                BitmapFactory.Options chk = new BitmapFactory.Options();
-                chk.inJustDecodeBounds = true;
-                BitmapFactory.decodeByteArray(uprightJpeg, 0, uprightJpeg.length, chk);
-                if (chk.outHeight > chk.outWidth) {
-                    // Emergency: rotate 90 more
-                    receipt.append("SANITY: landscape H>W, applying +90\u00B0 correction\n");
-                    uprightJpeg = rotateJpegPixels(uprightJpeg, 90);
-                }
-
-                byte[] finalJpeg;
-                boolean isPortrait = (currentOrient == OrientMode.PORTRAIT);
-                int cropX = 0, cropY = 0, cropW = 0, cropH = 0;
-
-                if (isPortrait) {
-                    // Step 2: Center-crop to 3:4 and rotate to portrait
-                    Object[] cropResult = cropToPortrait(uprightJpeg);
-                    finalJpeg = (byte[]) cropResult[0];
-                    cropX = (int) cropResult[1];
-                    cropY = (int) cropResult[2];
-                    cropW = (int) cropResult[3];
-                    cropH = (int) cropResult[4];
-                } else {
-                    finalJpeg = uprightJpeg;
-                }
+                // Rotate pixels to upright using the shared helper
+                byte[] finalJpeg = rotateJpegPixels(jpegData[0], uprightDeg);
 
                 // Decode final dimensions
                 BitmapFactory.Options opts = new BitmapFactory.Options();
@@ -1182,49 +966,22 @@ public class MainActivity extends AppCompatActivity {
                 int dw = opts.outWidth, dh = opts.outHeight;
                 double mp = (long) dw * dh / 1e6;
 
-                // Final sanity check
-                boolean orientCorrect;
-                if (isPortrait) {
-                    orientCorrect = (dh >= dw);
-                    if (!orientCorrect) {
-                        receipt.append("SANITY: portrait W>H, applying +90\u00B0 correction\n");
-                        finalJpeg = rotateJpegPixels(finalJpeg, 90);
-                        opts = new BitmapFactory.Options();
-                        opts.inJustDecodeBounds = true;
-                        BitmapFactory.decodeByteArray(finalJpeg, 0, finalJpeg.length, opts);
-                        dw = opts.outWidth; dh = opts.outHeight;
-                        mp = (long) dw * dh / 1e6;
-                        orientCorrect = (dh >= dw);
-                    }
-                } else {
-                    orientCorrect = (dw >= dh);
-                    if (!orientCorrect) {
-                        receipt.append("SANITY: landscape H>W after process, applying +90\u00B0 correction\n");
-                        finalJpeg = rotateJpegPixels(finalJpeg, 90);
-                        opts = new BitmapFactory.Options();
-                        opts.inJustDecodeBounds = true;
-                        BitmapFactory.decodeByteArray(finalJpeg, 0, finalJpeg.length, opts);
-                        dw = opts.outWidth; dh = opts.outHeight;
-                        mp = (long) dw * dh / 1e6;
-                        orientCorrect = (dw >= dh);
-                    }
+                // Sanity check: for a landscape-locked device, W should be >= H
+                // (unless sensor is in a weird state). Log it but don't force-rotate.
+                boolean orientCorrect = (dw >= dh);
+                if (!orientCorrect) {
+                    receipt.append("NOTE: W<H after rotation (").append(dw).append("x").append(dh)
+                        .append("). Sensor may have unusual orientation.\n");
                 }
 
-                String orientSuffix = isPortrait ? "_port" : "_land";
-                String jname = "FlashCam_" + ts + "_" + mpLabel + orientSuffix + ".jpg";
+                String jname = "FlashCam_" + ts + "_" + mpLabel + "_full.jpg";
                 File savedFile = saveToMediaStore(finalJpeg, jname, "image/jpeg");
 
                 receipt.append("\u2500\u2500 JPEG \u2500\u2500\n");
                 receipt.append("Sensor raw: ").append(dims[0][0]).append("x").append(dims[0][1]).append("\n");
-                receipt.append("Upright rotation applied: ").append(uprightDeg).append("\u00B0\n");
-                if (isPortrait) {
-                    receipt.append("Crop: center ").append(cropW).append("x").append(cropH)
-                        .append(" from (").append(cropX).append(",").append(cropY).append(")\n");
-                    receipt.append("Then rotated 90\u00B0 CW to portrait\n");
-                }
-                receipt.append("Actual saved: ").append(dw).append("x").append(dh)
+                receipt.append("Rotation applied: ").append(uprightDeg).append("\u00B0\n");
+                receipt.append("Saved: ").append(dw).append("x").append(dh)
                     .append(" (").append(String.format(Locale.US, "%.1f", mp)).append(" MP)\n");
-                receipt.append("Orientation correct: ").append(orientCorrect ? "YES" : "NO (MISMATCH!)").append("\n");
                 receipt.append("File: ").append(savedFile != null ? savedFile.getAbsolutePath() : "SAVE FAILED").append("\n");
                 receipt.append("Size: ").append(savedFile != null ?
                     String.format(Locale.US, "%,d bytes (%.2f MB)", savedFile.length(),
@@ -1248,7 +1005,7 @@ public class MainActivity extends AppCompatActivity {
                 } else if (orientCorrect) {
                     receipt.append("VERDICT: Capture OK\n");
                 } else {
-                    receipt.append("VERDICT: WARNING - orientation mismatch\n");
+                    receipt.append("VERDICT: Check orientation in Gallery\n");
                 }
             } else {
                 receipt.append("\u2500\u2500 JPEG: NO DATA \u2500\u2500\n");
@@ -1314,8 +1071,7 @@ public class MainActivity extends AppCompatActivity {
             finishCapture("Error: " + e.getMessage());
             return;
         } finally {
-            // ImageReaders are closed when they go out of scope via GC,
-            // but we should restart preview regardless
+            // ImageReaders are closed when they go out of scope via GC
         }
 
         capturing = false;
@@ -1351,9 +1107,8 @@ public class MainActivity extends AppCompatActivity {
                 }
 
                 String ts = new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date());
-                String orientLabel = (currentOrient == OrientMode.PORTRAIT) ? "port" : "land";
                 String resLabel = (currentVideo == VideoMode.V4K) ? "4k" : "1080p";
-                String filename = "FlashCamVID_" + ts + "_" + resLabel + "_" + orientLabel + ".mp4";
+                String filename = "FlashCamVID_" + ts + "_" + resLabel + ".mp4";
 
                 File dir = new File(Environment.getExternalStoragePublicDirectory(
                     Environment.DIRECTORY_PICTURES), "FlashCam-Air3");
@@ -1375,12 +1130,8 @@ public class MainActivity extends AppCompatActivity {
                 mediaRecorder.setAudioEncodingBitRate(128_000);
                 mediaRecorder.setAudioSamplingRate(44100);
 
-                // Orientation hint
-                int orientHint = getUprightRotationDegrees();
-                if (currentOrient == OrientMode.PORTRAIT) {
-                    orientHint = (orientHint + 90) % 360;
-                }
-                mediaRecorder.setOrientationHint(orientHint);
+                // Video orientation hint uses the same shared helper
+                mediaRecorder.setOrientationHint(getDisplayUprightRotationDegrees());
 
                 mediaRecorder.prepare();
 
@@ -1610,9 +1361,8 @@ public class MainActivity extends AppCompatActivity {
             case MP12: mpText = "12 MP"; break;
             default:   mpText = "16 MP"; break;
         }
-        String orientText = (currentOrient == OrientMode.LANDSCAPE) ? "LAND" : "PORT";
         btnMode.setText(mpText);
-        tvMode.setText(mpText + " " + orientText);
+        tvMode.setText(mpText + " FULL");
     }
 
     private void adjustEv(int delta) {
