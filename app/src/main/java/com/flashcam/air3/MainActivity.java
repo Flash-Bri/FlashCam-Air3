@@ -21,7 +21,6 @@ import android.hardware.camera2.DngCreator;
 import android.media.ExifInterface;
 import android.media.Image;
 import android.media.ImageReader;
-import android.media.MediaRecorder;
 import android.media.MediaScannerConnection;
 import android.net.Uri;
 import android.os.Build;
@@ -30,7 +29,6 @@ import android.os.Environment;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.Looper;
-import android.os.SystemClock;
 import android.provider.MediaStore;
 import android.util.Log;
 import android.util.Size;
@@ -38,7 +36,6 @@ import android.view.Surface;
 import android.view.TextureView;
 import android.view.View;
 import android.widget.Button;
-import android.widget.Chronometer;
 import android.widget.FrameLayout;
 import android.widget.ImageButton;
 import android.widget.LinearLayout;
@@ -71,22 +68,17 @@ public class MainActivity extends AppCompatActivity {
     private static final String TAG = "FlashCam";
     private static final int PERM_CODE = 100;
     private static final int COLOR_ORANGE = 0xFFFF6600;
-    private static final int COLOR_RED = 0xFFFF0000;
-    private static final String APP_VERSION = "1.6.0";
+    private static final String APP_VERSION = "1.6.1";
 
     // ── Enums ──
     enum MpMode { MP8, MP12, MP16 }
-    enum VideoMode { V1080, V4K }
-    enum CamState { INIT, OPENING, PREVIEW, CAPTURING, RECORDING, ERROR }
+    enum CamState { INIT, OPENING, PREVIEW, CAPTURING, ERROR }
 
     // ── State ──
     private MpMode currentMp = MpMode.MP16;
-    private VideoMode currentVideo = VideoMode.V1080;
     private boolean dngEnabled = false;
     private boolean debugEnabled = false;
-    private boolean videoMode = false;
     private boolean capturing = false;
-    private boolean isRecording = false;
     private int currentEv = 0;
 
     // ── Camera ──
@@ -103,7 +95,6 @@ public class MainActivity extends AppCompatActivity {
     private Size[] maxResJpegSizes;
     private Size[] maxResRawSizes;
     private boolean hasMaxRes = false;
-    private boolean has4K = false;
 
     // ── Threads ──
     private HandlerThread camThread;
@@ -116,14 +107,13 @@ public class MainActivity extends AppCompatActivity {
     private TextureView textureView;
     private View shutterFlashOverlay;
     private View focusRing;
-    private TextView tvStatus, tvMode, tvFocusIndicator, tvEv, tvRecTimer;
+    private TextView tvStatus, tvMode, tvFocusIndicator, tvEv;
     private TextView tvReceipt;
     private ImageButton btnShutter;
-    private Button btnMode, btnDng, btnVideo, btnDebug, btnCredits;
+    private Button btnMode, btnDng, btnDebug, btnCredits;
     private Button btnEvPlus, btnEvMinus;
     private Button btnCopyReceipt, btnExportLog, btnDismiss;
     private LinearLayout receiptPanel;
-    private Chronometer chronoRec;
 
     // ── State machine ──
     private CamState camState = CamState.INIT;
@@ -133,10 +123,6 @@ public class MainActivity extends AppCompatActivity {
     // ── Receipt log ──
     private String lastReceipt = "";
     private final List<String> receiptLog = new ArrayList<>();
-
-    // ── Video ──
-    private MediaRecorder mediaRecorder;
-    private String currentVideoPath;
 
     // ================================================================
     // LIFECYCLE
@@ -195,12 +181,10 @@ public class MainActivity extends AppCompatActivity {
         tvMode = findViewById(R.id.tvMode);
         tvFocusIndicator = findViewById(R.id.tvFocusIndicator);
         tvEv = findViewById(R.id.tvEv);
-        tvRecTimer = findViewById(R.id.tvRecTimer);
         tvReceipt = findViewById(R.id.tvReceipt);
         btnShutter = findViewById(R.id.btnShutter);
         btnMode = findViewById(R.id.btnMode);
         btnDng = findViewById(R.id.btnDng);
-        btnVideo = findViewById(R.id.btnVideo);
         btnDebug = findViewById(R.id.btnDebug);
         btnCredits = findViewById(R.id.btnCredits);
         btnEvPlus = findViewById(R.id.btnEvPlus);
@@ -209,7 +193,6 @@ public class MainActivity extends AppCompatActivity {
         btnExportLog = findViewById(R.id.btnExportLog);
         btnDismiss = findViewById(R.id.btnDismiss);
         receiptPanel = findViewById(R.id.receiptPanel);
-        chronoRec = findViewById(R.id.chronoRec);
     }
 
     private void setupListeners() {
@@ -234,15 +217,11 @@ public class MainActivity extends AppCompatActivity {
         });
 
         btnShutter.setOnClickListener(v -> {
-            if (videoMode) {
-                if (isRecording) stopRecording(); else startRecording();
-            } else {
-                if (!capturing) {
-                    capturing = true;
-                    btnShutter.setEnabled(false);
-                    triggerShutterFlash();
-                    workerHandler.post(this::doCapture);
-                }
+            if (!capturing) {
+                capturing = true;
+                btnShutter.setEnabled(false);
+                triggerShutterFlash();
+                workerHandler.post(this::doCapture);
             }
         });
 
@@ -263,15 +242,6 @@ public class MainActivity extends AppCompatActivity {
                 dngEnabled ? COLOR_ORANGE : 0xFF333333));
         });
 
-        btnVideo.setOnClickListener(v -> {
-            videoMode = !videoMode;
-            btnVideo.setText(videoMode ? "VIDEO" : "PHOTO");
-            btnVideo.setBackgroundTintList(android.content.res.ColorStateList.valueOf(
-                videoMode ? COLOR_RED : 0xFF333333));
-            btnShutter.setBackground(getDrawable(
-                videoMode ? R.drawable.record_button : R.drawable.shutter_button));
-        });
-
         btnEvPlus.setOnClickListener(v -> adjustEv(1));
         btnEvMinus.setOnClickListener(v -> adjustEv(-1));
 
@@ -284,7 +254,9 @@ public class MainActivity extends AppCompatActivity {
         btnCredits.setOnClickListener(v -> {
             new AlertDialog.Builder(this)
                 .setTitle("FlashCam Air3 v" + APP_VERSION)
-                .setMessage("Full-resolution camera for INMO Air3.\n\n"
+                .setMessage("Full-resolution photo camera for INMO Air3.\n\n"
+                    + "Photo-only app \u2014 video is intentionally disabled to prevent "
+                    + "dangerous heat buildup on the Air3.\n\n"
                     + "Developed with assistance from Manus AI and ChatGPT (OpenAI).\n\n"
                     + "Unlocks 16MP (4608\u00D73456) JPEG and 16.3MP (4656\u00D73496) RAW/DNG "
                     + "capture via Camera2 SENSOR_PIXEL_MODE = MAXIMUM_RESOLUTION.\n\n"
@@ -304,7 +276,6 @@ public class MainActivity extends AppCompatActivity {
     private void checkPermissions() {
         List<String> needed = new ArrayList<>();
         needed.add(Manifest.permission.CAMERA);
-        needed.add(Manifest.permission.RECORD_AUDIO);
         if (Build.VERSION.SDK_INT < 29) {
             needed.add(Manifest.permission.WRITE_EXTERNAL_STORAGE);
         }
@@ -365,14 +336,6 @@ public class MainActivity extends AppCompatActivity {
             if (defaultMap != null) {
                 defaultJpegSizes = defaultMap.getOutputSizes(ImageFormat.JPEG);
                 previewSize = findBest43Preview(defaultMap.getOutputSizes(SurfaceTexture.class));
-
-                // Check for 4K video
-                Size[] videoSizes = defaultMap.getOutputSizes(MediaRecorder.class);
-                if (videoSizes != null) {
-                    for (Size s : videoSizes) {
-                        if (s.getWidth() >= 3840 && s.getHeight() >= 2160) { has4K = true; break; }
-                    }
-                }
             }
 
             // Max-res stream map (API 31+)
@@ -460,12 +423,6 @@ public class MainActivity extends AppCompatActivity {
 
     private void closeCamera() {
         try {
-            if (isRecording) {
-                try { mediaRecorder.stop(); } catch (Exception ignored) {}
-                try { mediaRecorder.release(); } catch (Exception ignored) {}
-                mediaRecorder = null;
-                isRecording = false;
-            }
             if (previewSession != null) { previewSession.close(); previewSession = null; }
             if (cameraDevice != null) { cameraDevice.close(); cameraDevice = null; }
         } catch (Exception ignored) {}
@@ -544,42 +501,39 @@ public class MainActivity extends AppCompatActivity {
     }
 
     // ================================================================
-    // SHARED ROTATION HELPER
+    // ROTATION HELPERS
     // ================================================================
 
     /**
-     * Rotation needed to map sensor buffer → display upright (Air3 landscape-locked).
+     * Rotation to apply to JPEG pixel data from the ImageReader so the saved
+     * image appears upright.
      *
-     * IMPORTANT: This uses the INVERSE formula (degrees - sensorOrientation)
-     * which is the correct mapping for a landscape-locked device where the
-     * sensor is mounted at 270°.
+     * The JPEG from ImageReader arrives in the sensor's native orientation.
+     * On the Air3 (sensorOrientation=270, landscape-locked), the sensor buffer
+     * needs to be rotated by sensorOrientation degrees to appear upright.
      *
-     * Used for: preview transform, JPEG pixel rotation, video orientation hint.
+     * Evidence-based: v1.6.0 applied 90° and got 180° upside down.
+     * Correct value is sensorOrientation (270°) for the Air3.
      */
-    private int getDisplayUprightRotationDegrees() {
-        int deviceRotation = getWindowManager().getDefaultDisplay().getRotation();
-        int degrees = 0;
-        switch (deviceRotation) {
-            case Surface.ROTATION_0:   degrees = 0;   break;
-            case Surface.ROTATION_90:  degrees = 90;  break;
-            case Surface.ROTATION_180: degrees = 180; break;
-            case Surface.ROTATION_270: degrees = 270; break;
-        }
-        // NOTE: IMPORTANT sign flip vs v1.5.1 code
-        return (degrees - sensorOrientation + 360) % 360;
+    private int getJpegRotationDegrees() {
+        return sensorOrientation;
     }
 
     // ================================================================
-    // PREVIEW TRANSFORM (LETTERBOX, NO DISTORTION)
+    // PREVIEW TRANSFORM (FIT, NO ROTATION)
     // ================================================================
 
     /**
-     * Simple, deterministic preview transform:
-     * 1. Map buffer rect → view rect using RectToRect CENTER (uniform fit)
-     * 2. Rotate by getDisplayUprightRotationDegrees() around view center
+     * Preview transform: fit the 4:3 preview buffer into the view with
+     * uniform scaling (letterbox). NO rotation is applied.
      *
-     * No multi-branch hacks. The preview shows the full 4:3 sensor frame
-     * letterboxed inside the landscape UI.
+     * Evidence-based: the TextureView on the Air3 already displays the
+     * preview buffer in the correct orientation. v1.6.0 applied 90° rotation
+     * to the preview and it appeared 90° CW from correct. Therefore the
+     * correct preview rotation is 0°.
+     *
+     * The TextureView by default stretches the buffer to fill the view.
+     * We undo that stretch and apply uniform fit-scale instead.
      */
     private void configurePreviewTransform(int viewWidth, int viewHeight) {
         if (previewSize == null || viewWidth == 0 || viewHeight == 0) return;
@@ -590,60 +544,26 @@ public class MainActivity extends AppCompatActivity {
         float centerX = viewWidth / 2f;
         float centerY = viewHeight / 2f;
 
-        int rotation = getDisplayUprightRotationDegrees();
-        boolean swapDims = (rotation == 90 || rotation == 270);
+        // No rotation — preview buffer is already correctly oriented on the Air3.
+        // Just need to undo the default stretch and apply uniform fit scale.
 
-        // After rotation, the buffer appears as these dimensions
-        float rotatedW = swapDims ? ph : pw;
-        float rotatedH = swapDims ? pw : ph;
-
-        // Build the transform matrix
-        Matrix matrix = new Matrix();
-
-        // The TextureView by default stretches the buffer (pw x ph) to fill (viewWidth x viewHeight).
-        // We need to:
-        // 1. Undo that default stretch
-        // 2. Apply rotation
-        // 3. Apply uniform scale to FIT
-
-        // Step 1: Undo default stretch by scaling buffer back to its natural size
-        // Default maps: pw → viewWidth, ph → viewHeight
-        // So undo: scaleX = pw/viewWidth, scaleY = ph/viewHeight
-        // Then apply rotation, then scale to fit.
-
-        // Simpler approach: work in buffer coordinates
-        RectF bufferRect = new RectF(0, 0, pw, ph);
-        RectF viewRect = new RectF(0, 0, viewWidth, viewHeight);
-
-        // After rotation, the effective buffer rect is rotatedW x rotatedH
-        RectF rotatedBufferRect = new RectF(0, 0, rotatedW, rotatedH);
-
-        // Compute uniform fit scale from rotated buffer to view
-        float fitScaleX = viewWidth / rotatedW;
-        float fitScaleY = viewHeight / rotatedH;
+        // Uniform fit scale: fit pw×ph into viewWidth×viewHeight
+        float fitScaleX = (float) viewWidth / pw;
+        float fitScaleY = (float) viewHeight / ph;
         float fitScale = Math.min(fitScaleX, fitScaleY);
 
-        // The TextureView default stretches pw→viewWidth and ph→viewHeight.
-        // We need to undo that and apply our own transform.
-        // Effective: for each axis, the net scale should be fitScale * (rotated dimension / original dimension after rotation)
+        Matrix matrix = new Matrix();
 
-        // Clean approach: translate to center, undo stretch, rotate, apply fit scale
+        // Step 1: Translate center to origin
         matrix.setTranslate(-centerX, -centerY);
 
-        // Undo the default stretch: the texture maps pw to viewWidth, ph to viewHeight
-        // So the current scale is viewWidth/pw in X and viewHeight/ph in Y
-        // We want the final to be fitScale (uniform) after rotation
-        // Undo stretch: multiply by pw/viewWidth in X, ph/viewHeight in Y
+        // Step 2: Undo the default stretch (TextureView maps pw→viewWidth, ph→viewHeight)
         matrix.postScale((float) pw / viewWidth, (float) ph / viewHeight);
 
-        // Now we're in buffer pixel coordinates centered at origin
-        // Apply rotation
-        matrix.postRotate(rotation);
-
-        // Now apply uniform fit scale
+        // Step 3: Apply uniform fit scale (no rotation)
         matrix.postScale(fitScale, fitScale);
 
-        // Translate back to view center
+        // Step 4: Translate back to view center
         matrix.postTranslate(centerX, centerY);
 
         textureView.setTransform(matrix);
@@ -940,7 +860,7 @@ public class MainActivity extends AppCompatActivity {
                 default:   mpLabel = "16MP"; break;
             }
 
-            int uprightDeg = getDisplayUprightRotationDegrees();
+            int jpegRotDeg = getJpegRotationDegrees();
 
             StringBuilder receipt = new StringBuilder();
             receipt.append("\u2550\u2550\u2550 CAPTURE RECEIPT \u2550\u2550\u2550\n");
@@ -948,7 +868,7 @@ public class MainActivity extends AppCompatActivity {
                 new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(new Date())).append("\n");
             receipt.append("Mode: ").append(mpLabel).append(maxRes ? " (MAX-RES)" : " (DEFAULT)").append("\n");
             receipt.append("sensorOrientation: ").append(sensorOrientation).append("\u00B0\n");
-            receipt.append("Display upright rotation: ").append(uprightDeg).append("\u00B0\n");
+            receipt.append("JPEG pixel rotation: ").append(jpegRotDeg).append("\u00B0\n");
             receipt.append("JPEG_ORIENTATION sent: 0\u00B0 (pixel rotation in software)\n");
             receipt.append("EV: ").append((currentEv >= 0 ? "+" : "")).append(currentEv).append("\n");
 
@@ -956,8 +876,8 @@ public class MainActivity extends AppCompatActivity {
             if (jpegData[0] != null) {
                 setStatusForced("Processing JPEG...");
 
-                // Rotate pixels to upright using the shared helper
-                byte[] finalJpeg = rotateJpegPixels(jpegData[0], uprightDeg);
+                // Rotate pixels to upright using sensorOrientation
+                byte[] finalJpeg = rotateJpegPixels(jpegData[0], jpegRotDeg);
 
                 // Decode final dimensions
                 BitmapFactory.Options opts = new BitmapFactory.Options();
@@ -967,7 +887,6 @@ public class MainActivity extends AppCompatActivity {
                 double mp = (long) dw * dh / 1e6;
 
                 // Sanity check: for a landscape-locked device, W should be >= H
-                // (unless sensor is in a weird state). Log it but don't force-rotate.
                 boolean orientCorrect = (dw >= dh);
                 if (!orientCorrect) {
                     receipt.append("NOTE: W<H after rotation (").append(dw).append("x").append(dh)
@@ -979,7 +898,7 @@ public class MainActivity extends AppCompatActivity {
 
                 receipt.append("\u2500\u2500 JPEG \u2500\u2500\n");
                 receipt.append("Sensor raw: ").append(dims[0][0]).append("x").append(dims[0][1]).append("\n");
-                receipt.append("Rotation applied: ").append(uprightDeg).append("\u00B0\n");
+                receipt.append("Rotation applied: ").append(jpegRotDeg).append("\u00B0\n");
                 receipt.append("Saved: ").append(dw).append("x").append(dh)
                     .append(" (").append(String.format(Locale.US, "%.1f", mp)).append(" MP)\n");
                 receipt.append("File: ").append(savedFile != null ? savedFile.getAbsolutePath() : "SAVE FAILED").append("\n");
@@ -993,11 +912,12 @@ public class MainActivity extends AppCompatActivity {
                         ExifInterface exif = new ExifInterface(savedFile.getAbsolutePath());
                         exif.setAttribute(ExifInterface.TAG_ORIENTATION,
                             String.valueOf(ExifInterface.ORIENTATION_NORMAL));
-                        exif.setAttribute(ExifInterface.TAG_MAKE, "INMO");
-                        exif.setAttribute(ExifInterface.TAG_MODEL, "Air3 IMA301");
-                        exif.setAttribute(ExifInterface.TAG_SOFTWARE, "FlashCam-Air3 v" + APP_VERSION);
+                        exif.setAttribute(ExifInterface.TAG_SOFTWARE,
+                            "FlashCam-Air3 v" + APP_VERSION);
                         exif.saveAttributes();
-                    } catch (Exception ignored) {}
+                    } catch (Exception exifErr) {
+                        receipt.append("EXIF write error: ").append(exifErr.getMessage()).append("\n");
+                    }
                 }
 
                 if (maxRes && mp >= 11.5) {
@@ -1021,7 +941,7 @@ public class MainActivity extends AppCompatActivity {
 
                     // DNG stores raw sensor data — set orientation tag so viewers know how to rotate
                     int dngExifOrientation;
-                    switch (uprightDeg) {
+                    switch (sensorOrientation) {
                         case 90:  dngExifOrientation = ExifInterface.ORIENTATION_ROTATE_90; break;
                         case 180: dngExifOrientation = ExifInterface.ORIENTATION_ROTATE_180; break;
                         case 270: dngExifOrientation = ExifInterface.ORIENTATION_ROTATE_270; break;
@@ -1086,168 +1006,6 @@ public class MainActivity extends AppCompatActivity {
         try { Thread.sleep(300); } catch (InterruptedException ignored) {}
         if (cameraDevice != null) startPreview();
         mainHandler.post(() -> btnShutter.setEnabled(true));
-    }
-
-    // ================================================================
-    // VIDEO RECORDING
-    // ================================================================
-    private void startRecording() {
-        if (cameraDevice == null || isRecording) return;
-
-        workerHandler.post(() -> {
-            try {
-                if (previewSession != null) {
-                    previewSession.close(); previewSession = null;
-                    Thread.sleep(200);
-                }
-
-                int width = 1920, height = 1080;
-                if (currentVideo == VideoMode.V4K && has4K) {
-                    width = 3840; height = 2160;
-                }
-
-                String ts = new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date());
-                String resLabel = (currentVideo == VideoMode.V4K) ? "4k" : "1080p";
-                String filename = "FlashCamVID_" + ts + "_" + resLabel + ".mp4";
-
-                File dir = new File(Environment.getExternalStoragePublicDirectory(
-                    Environment.DIRECTORY_PICTURES), "FlashCam-Air3");
-                if (!dir.exists()) dir.mkdirs();
-                File videoFile = new File(dir, filename);
-                currentVideoPath = videoFile.getAbsolutePath();
-
-                mediaRecorder = new MediaRecorder();
-                mediaRecorder.setAudioSource(MediaRecorder.AudioSource.MIC);
-                mediaRecorder.setVideoSource(MediaRecorder.VideoSource.SURFACE);
-                mediaRecorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4);
-                mediaRecorder.setOutputFile(currentVideoPath);
-                mediaRecorder.setVideoEncodingBitRate(
-                    currentVideo == VideoMode.V4K ? 48_000_000 : 16_000_000);
-                mediaRecorder.setVideoFrameRate(30);
-                mediaRecorder.setVideoSize(width, height);
-                mediaRecorder.setVideoEncoder(MediaRecorder.VideoEncoder.H264);
-                mediaRecorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC);
-                mediaRecorder.setAudioEncodingBitRate(128_000);
-                mediaRecorder.setAudioSamplingRate(44100);
-
-                // Video orientation hint uses the same shared helper
-                mediaRecorder.setOrientationHint(getDisplayUprightRotationDegrees());
-
-                mediaRecorder.prepare();
-
-                // Create session with preview + recorder
-                SurfaceTexture st = textureView.getSurfaceTexture();
-                Size ps = previewSize != null ? previewSize : new Size(1440, 1080);
-                st.setDefaultBufferSize(ps.getWidth(), ps.getHeight());
-                Surface previewSurface = new Surface(st);
-                Surface recorderSurface = mediaRecorder.getSurface();
-
-                CaptureRequest.Builder recBuilder =
-                    cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_RECORD);
-                recBuilder.addTarget(previewSurface);
-                recBuilder.addTarget(recorderSurface);
-                recBuilder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON);
-                recBuilder.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, currentEv);
-
-                List<OutputConfiguration> outputs = Arrays.asList(
-                    new OutputConfiguration(previewSurface),
-                    new OutputConfiguration(recorderSurface)
-                );
-
-                Executor vidExec = camHandler::post;
-                final Object sessLock = new Object();
-                final int[] sessResult = {-999};
-
-                SessionConfiguration vidSessConfig = new SessionConfiguration(
-                    SessionConfiguration.SESSION_REGULAR, outputs, vidExec,
-                    new CameraCaptureSession.StateCallback() {
-                        @Override public void onConfigured(@NonNull CameraCaptureSession session) {
-                            previewSession = session;
-                            synchronized (sessLock) { sessResult[0] = 0; sessLock.notifyAll(); }
-                        }
-                        @Override public void onConfigureFailed(@NonNull CameraCaptureSession session) {
-                            synchronized (sessLock) { sessResult[0] = -1; sessLock.notifyAll(); }
-                        }
-                    });
-
-                cameraDevice.createCaptureSession(vidSessConfig);
-                synchronized (sessLock) {
-                    if (sessResult[0] == -999) sessLock.wait(30_000);
-                }
-
-                if (sessResult[0] != 0) {
-                    transitionState(CamState.ERROR);
-                    return;
-                }
-
-                previewSession.setRepeatingRequest(recBuilder.build(), null, camHandler);
-                mediaRecorder.start();
-                isRecording = true;
-
-                transitionState(CamState.RECORDING);
-                mainHandler.post(() -> {
-                    tvRecTimer.setVisibility(View.VISIBLE);
-                    tvRecTimer.setText("\u25CF REC");
-                    tvRecTimer.setTextColor(COLOR_RED);
-                    chronoRec.setVisibility(View.VISIBLE);
-                    chronoRec.setBase(SystemClock.elapsedRealtime());
-                    chronoRec.start();
-                    btnShutter.setBackground(getDrawable(R.drawable.record_button));
-                });
-
-            } catch (Exception e) {
-                setStatusForced("Record error: " + e.getMessage());
-                isRecording = false;
-            }
-        });
-    }
-
-    private void stopRecording() {
-        if (!isRecording) return;
-
-        workerHandler.post(() -> {
-            try {
-                isRecording = false;
-                mediaRecorder.stop();
-                mediaRecorder.reset();
-                mediaRecorder.release();
-                mediaRecorder = null;
-
-                mainHandler.post(() -> {
-                    chronoRec.stop();
-                    chronoRec.setVisibility(View.GONE);
-                    tvRecTimer.setVisibility(View.GONE);
-                    btnShutter.setBackground(getDrawable(R.drawable.shutter_button));
-                });
-
-                if (currentVideoPath != null) {
-                    MediaScannerConnection.scanFile(this,
-                        new String[]{currentVideoPath}, new String[]{"video/mp4"}, null);
-                }
-
-                setStatusForced("Video saved!");
-
-                if (debugEnabled) {
-                    File vf = new File(currentVideoPath);
-                    String receipt = "\u2550\u2550\u2550 VIDEO RECEIPT \u2550\u2550\u2550\n"
-                        + "File: " + currentVideoPath + "\n"
-                        + "Size: " + String.format(Locale.US, "%,d bytes (%.2f MB)",
-                            vf.length(), vf.length() / 1048576.0) + "\n"
-                        + "\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n";
-                    lastReceipt = receipt;
-                    mainHandler.post(() -> {
-                        tvReceipt.setText(receipt);
-                        receiptPanel.setVisibility(View.VISIBLE);
-                    });
-                }
-
-            } catch (Exception e) {
-                setStatusForced("Stop error: " + e.getMessage());
-            }
-
-            try { Thread.sleep(300); } catch (InterruptedException ignored) {}
-            startPreview();
-        });
     }
 
     // ================================================================
@@ -1453,7 +1211,6 @@ public class MainActivity extends AppCompatActivity {
             case OPENING:   text = "Opening camera..."; break;
             case PREVIEW:   text = "Ready"; break;
             case CAPTURING: text = "Capturing..."; break;
-            case RECORDING: text = "Recording..."; break;
             case ERROR:     text = "Error"; break;
             default:        text = ""; break;
         }

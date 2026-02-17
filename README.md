@@ -2,7 +2,9 @@
 
 **Unlock the full 16MP camera on your INMO Air3 AR glasses — no root required.**
 
-FlashCam-Air3 is an open-source camera app that bypasses the INMO Air3's firmware-imposed 3MP capture limit by using the Android Camera2 `SENSOR_PIXEL_MODE = MAXIMUM_RESOLUTION` API. The Air3's 16MP sensor (4656×3496) is fully accessible to standard apps through the max-resolution stream map — INMO just never exposed it in their default camera app.
+FlashCam-Air3 is an open-source **photo-only** camera app that bypasses the INMO Air3's firmware-imposed 3MP capture limit by using the Android Camera2 `SENSOR_PIXEL_MODE = MAXIMUM_RESOLUTION` API. The Air3's 16MP sensor (4656×3496) is fully accessible to standard apps through the max-resolution stream map — INMO just never exposed it in their default camera app.
+
+> **Photo-only by design.** Video recording has been intentionally removed from FlashCam-Air3. See [Why No Video?](#why-no-video) below.
 
 ## Key Discovery
 
@@ -25,22 +27,15 @@ This app uses the standard Camera2 API to capture at these full resolutions. No 
 - Proper pixel-rotated orientation (images saved upright, not relying on EXIF rotation)
 
 ### Upright Preview & Capture
-- Preview shows the **real world upright** (matching reality) in the Air3's landscape-locked UI
+- Preview shows the **real world upright** (matching reality) in the Air3's landscape UI
 - Saved JPEG matches the preview framing and orientation exactly
-- Uses the **inverse rotation formula** `(displayDegrees - sensorOrientation + 360) % 360` to correctly map sensor buffer to display
 - **Software pixel rotation** — saved images are physically rotated to be upright using `android.graphics.Matrix`. `JPEG_ORIENTATION` is set to 0 (never trusted). EXIF orientation is always NORMAL for maximum compatibility.
-- One shared rotation helper used for preview transform, JPEG rotation, and video orientation hint — no divergence possible.
 
 ### RAW/DNG Support
 - Toggle DNG capture on/off (default: off to reduce capture delay)
 - Proper `.dng` files via `DngCreator` with full metadata
 - Opens in Lightroom, Photoshop, Google Photos, and any DNG-compatible editor
 - DNG and JPEG share the same timestamp for easy pairing
-
-### Video Recording
-- **1080p @ 30fps** and **4K @ 30fps** (if supported by HAL)
-- Recording indicator with timer
-- Proper orientation metadata for correct gallery playback
 
 ### Camera Controls
 - **Tap-to-focus** with visual focus ring indicator
@@ -55,8 +50,23 @@ This app uses the standard Camera2 API to capture at these full resolutions. No 
 
 ### Debug/Receipt System
 - Toggle debug receipts on/off (default: off)
-- After each capture, shows: mode, sensorOrientation, display upright rotation, requested vs actual dimensions, file path, file size
+- After each capture, shows: mode, sensorOrientation, JPEG rotation applied, requested vs actual dimensions, file path, file size
 - Copy receipt to clipboard or export full capture log (last 50 captures)
+
+## Why No Video?
+
+Video recording has been **intentionally removed** from FlashCam-Air3 for safety and practical reasons:
+
+**Heat danger.** The INMO Air3 is a compact AR glasses form factor worn directly on the face. Sustained video recording drives continuous sensor readout, encoding, and storage I/O, which generates significant heat. On a device this small with limited thermal dissipation, this can become **dangerously hot** — especially near the eyes and temples. FlashCam-Air3 prioritizes user safety over feature completeness.
+
+**16MP is not needed for video.** Video recording uses the **default stream map**, not the max-resolution stream map. The entire purpose of FlashCam-Air3 is to unlock the full 16MP sensor for still photos. Video frames are captured at standard resolutions that the default INMO camera app already supports:
+
+| Video Mode | Frame Resolution | Megapixels per Frame |
+|-----------|-----------------|---------------------|
+| 1080p @ 30fps | 1920×1080 | 2.1 MP |
+| 4K @ 30fps | 3840×2160 | 8.3 MP |
+
+Since video does not benefit from the max-resolution unlock, and the default camera app already handles video at these resolutions, there is no reason for FlashCam-Air3 to duplicate that functionality while introducing a heat risk.
 
 ## Device Compatibility
 
@@ -136,42 +146,46 @@ The `keystore.properties` file and all `*.jks` / `*.keystore` files are in `.git
 | Permission | Purpose |
 |-----------|---------|
 | `CAMERA` | Camera access for preview and capture |
-| `RECORD_AUDIO` | Audio recording for video mode |
 | `READ_MEDIA_IMAGES` | Gallery access (Android 13+) |
-| `READ_MEDIA_VIDEO` | Gallery access for video (Android 13+) |
 
-## Test Checklist (v1.6.0)
+> **Note:** `RECORD_AUDIO` and `READ_MEDIA_VIDEO` permissions have been removed as of v1.6.1 since video recording is no longer included.
+
+## Test Checklist (v1.6.1)
 
 Use this checklist to verify all features after installing:
 
 | # | Test | Expected Result |
 |---|------|----------------|
 | 1 | Launch app, grant CAMERA permission | Preview appears, status shows "Ready" |
-| 2 | Preview matches real-world orientation | No 90° left shift — what you see matches reality |
+| 2 | Preview matches real-world orientation | No rotation error — what you see matches reality |
 | 3 | Tap shutter in 16MP | Receipt shows 4608×3456, image upright in Gallery |
 | 4 | Capture result matches preview framing | Saved image has same framing and orientation as preview |
 | 5 | Toggle DNG ON, capture in 16MP | DNG file saved alongside JPEG, ~31MB |
-| 6 | Open saved JPEG in Gallery | Image is upright (not sideways) |
+| 6 | Open saved JPEG in Gallery | Image is upright (not sideways or upside down) |
 | 7 | Open saved DNG in Lightroom | DNG opens with correct orientation and white balance |
 | 8 | Tap preview to focus | Yellow focus ring appears at tap point, AF indicator updates |
 | 9 | Press EV+/EV- | Preview brightness changes, EV value updates |
 | 10 | Toggle to 8MP, capture | Receipt shows ~3264×2448 or closest size |
-| 11 | Switch to VIDEO mode, record 10s | Video saved, receipt shows file path and size |
-| 12 | Tap shutter 10 times rapidly | No orange square, no crash, white flash each time |
-| 13 | Leave idle 30 seconds | Status text stable, no flicker |
-| 14 | Enable DBG, capture, tap COPY | Receipt text copied to clipboard |
-| 15 | Tap EXPORT LOG | `flashcam_log.txt` saved to Pictures/FlashCam-Air3/ |
-| 16 | No portrait mode/crop overlay exists | No LAND/PORT button, no crop overlay anywhere |
+| 11 | Tap shutter 10 times rapidly | No orange square, no crash, white flash each time |
+| 12 | Leave idle 30 seconds | Status text stable, no flicker |
+| 13 | Enable DBG, capture, tap COPY | Receipt text copied to clipboard |
+| 14 | Tap EXPORT LOG | `flashcam_log.txt` saved to Pictures/FlashCam-Air3/ |
+| 15 | No video mode exists | No VIDEO/PHOTO button, no recording UI anywhere |
 
 ## Changelog
 
+### v1.6.1 — Rotation Fix + Photo-Only (No Video)
+- **Fixed preview rotation**: removed the incorrect rotation transform. The Air3's TextureView already displays the preview buffer correctly — no rotation needed.
+- **Fixed JPEG rotation**: JPEG pixel rotation now uses `sensorOrientation` (270°) directly, producing upright images. v1.6.0 used 90° and produced 180° upside-down images.
+- **Removed video recording entirely**: video generates potentially dangerous heat on the Air3's compact form factor. Video does not benefit from the 16MP max-resolution unlock (1080p = 2.1MP, 4K = 8.3MP). Use the default INMO camera app for video.
+- **Removed `RECORD_AUDIO` and `READ_MEDIA_VIDEO` permissions**: no longer needed.
+- **Deleted `record_button.xml` drawable**: no longer needed.
+
 ### v1.6.0 — Upright Preview + One-Mode Full Frame
-- **Fixed preview rotation**: replaced rotation formula with the correct inverse `(degrees - sensorOrientation + 360) % 360`. Preview now matches real-world orientation on the Air3.
-- **Removed portrait/landscape mode**: the app is now a one-mode full-frame camera. No crop, no portrait overlay. Users crop later if desired.
-- **Simplified preview transform**: clean RectToRect + rotation approach, no multi-branch hacks.
-- **One shared rotation helper** (`getDisplayUprightRotationDegrees()`) used for preview, JPEG rotation, and video orientation hint.
-- **UI cleanup**: removed LAND/PORT button and indicators, mode display shows "16 MP FULL".
-- **Deleted `CaptureFrameOverlayView`**: no longer needed.
+- Replaced rotation formula with inverse `(degrees - sensorOrientation + 360) % 360` (still incorrect — fixed in v1.6.1)
+- Removed portrait/landscape mode — one-mode full-frame camera
+- Simplified preview transform
+- Removed LAND/PORT button, CaptureFrameOverlayView
 
 ### v1.5.1 — Orientation Fix + Portrait-as-Crop + Security
 - Software pixel rotation (never trust JPEG_ORIENTATION)
@@ -193,7 +207,7 @@ Use this checklist to verify all features after installing:
 1. **Max-res capture requires session switch** — switching between default and max-res modes requires closing and reopening the camera session, which causes a brief preview interruption (~0.5s)
 2. **No autofocus during max-res capture** — some devices may not support AF in max-res mode; the app falls back gracefully
 3. **DNG files are large** — ~31MB per capture at full sensor resolution
-4. **Video is always default-mode** — video recording uses the default stream map (not max-res)
+4. **No video** — intentionally removed for safety. Use the default INMO camera app for video.
 5. **SENSOR_PIXEL_MODE may not be supported on all devices** — all access is wrapped in try/catch; the app falls back gracefully to default mode if the API throws.
 6. **INMO Air3 specific** — the app was designed for and tested on the INMO Air3. Other devices with `ULTRA_HIGH_RESOLUTION_SENSOR` may work but are untested.
 
@@ -208,18 +222,13 @@ Standard camera apps only query the default map. FlashCam-Air3 queries the max-r
 
 ### Orientation Handling
 
-The Air3 is a landscape-locked device with `sensorOrientation = 270°`. The correct rotation to make the sensor buffer upright on the display is:
+The Air3 has `sensorOrientation = 270°` and a landscape-locked display.
 
-```
-uprightDegrees = (displayDegrees - sensorOrientation + 360) % 360
-```
+**Preview:** The TextureView receives the camera preview buffer and displays it correctly without any rotation. The app applies only a uniform fit-scale transform (letterbox) to avoid distortion — no rotation matrix is needed.
 
-This single formula is used for:
-- **Preview transform** — rotating and scaling the TextureView buffer to match reality
-- **JPEG pixel rotation** — physically rotating the captured JPEG pixels before saving
-- **Video orientation hint** — setting `MediaRecorder.setOrientationHint()`
+**JPEG:** The JPEG from `ImageReader` arrives in the sensor's native orientation. The app rotates the decoded bitmap by `sensorOrientation` (270°) using `android.graphics.Matrix`, then re-encodes at quality 100. `JPEG_ORIENTATION` is always set to 0 (the sensor encoder is not trusted to rotate). EXIF orientation is always NORMAL.
 
-`JPEG_ORIENTATION` is always set to 0 (the sensor encoder is not trusted to rotate). All rotation is done in software after capture.
+**DNG:** Raw sensor data is saved unrotated. The EXIF orientation tag is set to `sensorOrientation` so viewers know how to display it.
 
 ## Troubleshooting
 
@@ -227,7 +236,7 @@ This single formula is used for:
 |-------|---------|
 | "Camera open failed" | Close all other camera apps, reboot the Air3, try again |
 | Max-res capture times out | Ensure no other app is using the camera; reboot |
-| Images appear sideways | Update to v1.6.0; the inverse rotation formula should fix this |
+| Images appear sideways or upside down | Update to v1.6.1; this version uses empirically-verified rotation values |
 | DNG won't open in editor | Ensure you're using a DNG-compatible editor (Lightroom, RawTherapee, etc.) |
 | App crashes on launch | Ensure Camera permission is granted in Settings > Apps > FlashCam-Air3 |
 | Preview shows black bars | Normal — letterbox/pillarbox areas are outside the 4:3 sensor frame |

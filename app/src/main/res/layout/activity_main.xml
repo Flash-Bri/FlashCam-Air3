@@ -66,36 +66,6 @@
             android:paddingStart="8dp" />
     </LinearLayout>
 
-    <!-- Recording indicator (top center) -->
-    <LinearLayout
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:layout_gravity="top|center_horizontal"
-        android:layout_marginTop="36dp"
-        android:orientation="horizontal"
-        android:gravity="center_vertical"
-        android:background="#99000000"
-        android:padding="4dp">
-
-        <TextView
-            android:id="@+id/tvRecTimer"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="● REC"
-            android:textColor="#FFFF0000"
-            android:textSize="14sp"
-            android:visibility="gone" />
-
-        <Chronometer
-            android:id="@+id/chronoRec"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:textColor="#FFFFFFFF"
-            android:textSize="14sp"
-            android:paddingStart="6dp"
-            android:visibility="gone" />
-    </LinearLayout>
-
     <!-- Left controls: EV, Debug, Credits -->
     <LinearLayout
         android:layout_width="wrap_content"
@@ -154,7 +124,7 @@
             android:backgroundTint="#FF222222" />
     </LinearLayout>
 
-    <!-- Right controls: MP mode, DNG, Video, Shutter -->
+    <!-- Right controls: MP mode, DNG, Shutter -->
     <LinearLayout
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
@@ -178,16 +148,6 @@
             android:layout_width="56dp"
             android:layout_height="40dp"
             android:text="DNG:OFF"
-            android:textColor="#FFFFFFFF"
-            android:textSize="9sp"
-            android:backgroundTint="#FF333333"
-            android:layout_marginBottom="4dp" />
-
-        <Button
-            android:id="@+id/btnVideo"
-            android:layout_width="56dp"
-            android:layout_height="40dp"
-            android:text="PHOTO"
             android:textColor="#FFFFFFFF"
             android:textSize="9sp"
             android:backgroundTint="#FF333333"
