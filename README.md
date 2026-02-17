@@ -17,11 +17,19 @@ This app uses the standard Camera2 API to capture at these full resolutions. No 
 
 ## Features
 
-### Still Photo Modes
+### Full-Frame Capture (One-Mode Camera)
 - **8MP / 12MP / 16MP** toggle — selects the closest available camera output size
 - **16MP** uses `SENSOR_PIXEL_MODE = MAXIMUM_RESOLUTION` for true full-sensor capture
 - JPEG quality fixed at 100%
+- **Always full frame** — no crop, no portrait/landscape mode. The saved image is exactly what the sensor captures. Users crop later if desired.
 - Proper pixel-rotated orientation (images saved upright, not relying on EXIF rotation)
+
+### Upright Preview & Capture
+- Preview shows the **real world upright** (matching reality) in the Air3's landscape-locked UI
+- Saved JPEG matches the preview framing and orientation exactly
+- Uses the **inverse rotation formula** `(displayDegrees - sensorOrientation + 360) % 360` to correctly map sensor buffer to display
+- **Software pixel rotation** — saved images are physically rotated to be upright using `android.graphics.Matrix`. `JPEG_ORIENTATION` is set to 0 (never trusted). EXIF orientation is always NORMAL for maximum compatibility.
+- One shared rotation helper used for preview transform, JPEG rotation, and video orientation hint — no divergence possible.
 
 ### RAW/DNG Support
 - Toggle DNG capture on/off (default: off to reduce capture delay)
@@ -31,7 +39,6 @@ This app uses the standard Camera2 API to capture at these full resolutions. No 
 
 ### Video Recording
 - **1080p @ 30fps** and **4K @ 30fps** (if supported by HAL)
-- Landscape and Portrait orientation modes
 - Recording indicator with timer
 - Proper orientation metadata for correct gallery playback
 
@@ -40,24 +47,15 @@ This app uses the standard Camera2 API to capture at these full resolutions. No 
 - **Exposure compensation** (EV+/EV-) with real-time preview adjustment
 - **AF/AE status indicator** showing focus and exposure state
 
-### Orientation & Preview Framing
-- **Landscape** (default): saves the full sensor frame (e.g., 4608×3456 for 16MP)
-- **Portrait**: center-crops the landscape frame to **3:4 aspect ratio**, then rotates 90° CW to produce a true portrait image (height > width). No pixel data is stretched — it's a clean crop from the center of the sensor.
-- **Software pixel rotation** — saved images are physically rotated to be upright using `android.graphics.Matrix` rotation. `JPEG_ORIENTATION` is set to 0 (never trusted). EXIF orientation is always NORMAL for maximum compatibility.
-- **Auto-correct** — after rotation, the app verifies W>H for landscape and H>W for portrait. If mismatched, an emergency 90° correction is applied and logged.
-- **Deterministic rotation** — uses `(sensorOrientation + deviceRotation) % 360` with a single code path. No conditional branches based on camera facing direction.
-- **Capture frame overlay** — a semi-transparent shade shows the area outside the capture frame, with an orange border marking the exact capture area. In Portrait mode, the overlay shows the 3:4 crop region.
-- Overlay updates instantly when toggling between Portrait and Landscape.
-
 ### Gallery Integration
 - Photos saved to `Pictures/FlashCam-Air3/` via **MediaStore** (scoped-storage safe)
 - Immediate Gallery visibility without manual scanning
 - Fallback to direct file write if MediaStore fails
-- File naming: `FlashCam_YYYYMMDD_HHMMSS_<8MP|12MP|16MP>_<land|port>.jpg`
+- File naming: `FlashCam_YYYYMMDD_HHMMSS_<8MP|12MP|16MP>_full.jpg`
 
 ### Debug/Receipt System
 - Toggle debug receipts on/off (default: off)
-- After each capture, shows: mode, orientation, sensorOrientation, JPEG_ORIENTATION sent, crop info (for portrait), requested vs actual dimensions, orientation correctness check, file path, file size
+- After each capture, shows: mode, sensorOrientation, display upright rotation, requested vs actual dimensions, file path, file size
 - Copy receipt to clipboard or export full capture log (last 50 captures)
 
 ## Device Compatibility
@@ -142,35 +140,53 @@ The `keystore.properties` file and all `*.jks` / `*.keystore` files are in `.git
 | `READ_MEDIA_IMAGES` | Gallery access (Android 13+) |
 | `READ_MEDIA_VIDEO` | Gallery access for video (Android 13+) |
 
-## Preview Framing Behavior
-
-The preview uses **center-crop scaling** to fill the display without distortion. The capture frame overlay shows exactly what will be saved:
-
-- **Landscape mode**: the overlay matches the full 4:3 sensor frame
-- **Portrait mode**: the overlay shows the 3:4 center-crop region — the shaded area on the sides will be cropped out of the saved image
-- **Tap-to-focus** only responds to taps within the clear (capture) area of the overlay
-- Focus coordinates are correctly mapped from the overlay region to sensor coordinates
-
-## Test Checklist (v1.5.1)
+## Test Checklist (v1.6.0)
 
 Use this checklist to verify all features after installing:
 
 | # | Test | Expected Result |
 |---|------|----------------|
 | 1 | Launch app, grant CAMERA permission | Preview appears, status shows "Ready" |
-| 2 | Tap shutter in LANDSCAPE + 16MP | Receipt shows 4608×3456, orientation correct: YES |
-| 3 | Toggle to PORTRAIT, tap shutter | Receipt shows ~2592×3456 (3:4 crop), H > W, orientation correct: YES |
-| 4 | Toggle DNG ON, capture in 16MP | DNG file saved alongside JPEG, ~31MB |
-| 5 | Open saved JPEG in Gallery | Image is upright (not sideways) |
-| 6 | Open saved DNG in Lightroom | DNG opens with correct orientation and white balance |
-| 7 | Tap preview to focus | Yellow focus ring appears at tap point, AF indicator updates |
-| 8 | Press EV+/EV- | Preview brightness changes, EV value updates |
-| 9 | Toggle to 8MP, capture | Receipt shows ~3264×2448 or closest size |
-| 10 | Switch to VIDEO mode, record 10s | Video saved, receipt shows file path and size |
-| 11 | Tap shutter 10 times rapidly | No orange square, no crash, white flash each time |
-| 12 | Leave idle 30 seconds | Status text stable, no flicker |
-| 13 | Enable DBG, capture, tap COPY | Receipt text copied to clipboard |
-| 14 | Tap EXPORT LOG | `flashcam_log.txt` saved to Pictures/FlashCam-Air3/ |
+| 2 | Preview matches real-world orientation | No 90° left shift — what you see matches reality |
+| 3 | Tap shutter in 16MP | Receipt shows 4608×3456, image upright in Gallery |
+| 4 | Capture result matches preview framing | Saved image has same framing and orientation as preview |
+| 5 | Toggle DNG ON, capture in 16MP | DNG file saved alongside JPEG, ~31MB |
+| 6 | Open saved JPEG in Gallery | Image is upright (not sideways) |
+| 7 | Open saved DNG in Lightroom | DNG opens with correct orientation and white balance |
+| 8 | Tap preview to focus | Yellow focus ring appears at tap point, AF indicator updates |
+| 9 | Press EV+/EV- | Preview brightness changes, EV value updates |
+| 10 | Toggle to 8MP, capture | Receipt shows ~3264×2448 or closest size |
+| 11 | Switch to VIDEO mode, record 10s | Video saved, receipt shows file path and size |
+| 12 | Tap shutter 10 times rapidly | No orange square, no crash, white flash each time |
+| 13 | Leave idle 30 seconds | Status text stable, no flicker |
+| 14 | Enable DBG, capture, tap COPY | Receipt text copied to clipboard |
+| 15 | Tap EXPORT LOG | `flashcam_log.txt` saved to Pictures/FlashCam-Air3/ |
+| 16 | No portrait mode/crop overlay exists | No LAND/PORT button, no crop overlay anywhere |
+
+## Changelog
+
+### v1.6.0 — Upright Preview + One-Mode Full Frame
+- **Fixed preview rotation**: replaced rotation formula with the correct inverse `(degrees - sensorOrientation + 360) % 360`. Preview now matches real-world orientation on the Air3.
+- **Removed portrait/landscape mode**: the app is now a one-mode full-frame camera. No crop, no portrait overlay. Users crop later if desired.
+- **Simplified preview transform**: clean RectToRect + rotation approach, no multi-branch hacks.
+- **One shared rotation helper** (`getDisplayUprightRotationDegrees()`) used for preview, JPEG rotation, and video orientation hint.
+- **UI cleanup**: removed LAND/PORT button and indicators, mode display shows "16 MP FULL".
+- **Deleted `CaptureFrameOverlayView`**: no longer needed.
+
+### v1.5.1 — Orientation Fix + Portrait-as-Crop + Security
+- Software pixel rotation (never trust JPEG_ORIENTATION)
+- Portrait mode as center-crop to 3:4 from full landscape frame
+- SENSOR_PIXEL_MODE crash protection (try/catch + reflection)
+- MediaStore saving (scoped storage safe)
+- Security: purged leaked keystore passwords from git history
+- Removed 3MP option, removed quality slider (always Q100)
+
+### v1.3 — Initial Release
+- Full 16MP JPEG and 16.3MP RAW/DNG capture
+- 8MP / 12MP / 16MP toggle
+- DNG support
+- Video recording (1080p/4K)
+- Tap-to-focus, exposure compensation
 
 ## Known Limitations
 
@@ -178,9 +194,8 @@ Use this checklist to verify all features after installing:
 2. **No autofocus during max-res capture** — some devices may not support AF in max-res mode; the app falls back gracefully
 3. **DNG files are large** — ~31MB per capture at full sensor resolution
 4. **Video is always default-mode** — video recording uses the default stream map (not max-res)
-5. **Portrait mode crops to ~75% of sensor width** — the 3:4 crop from a 4:3 landscape frame discards the left and right edges. This is by design (center-crop, not stretch).
-6. **SENSOR_PIXEL_MODE may not be supported on all devices** — all access is wrapped in try/catch; the app falls back gracefully to default mode if the API throws.
-7. **INMO Air3 specific** — the app was designed for and tested on the INMO Air3. Other devices with `ULTRA_HIGH_RESOLUTION_SENSOR` may work but are untested.
+5. **SENSOR_PIXEL_MODE may not be supported on all devices** — all access is wrapped in try/catch; the app falls back gracefully to default mode if the API throws.
+6. **INMO Air3 specific** — the app was designed for and tested on the INMO Air3. Other devices with `ULTRA_HIGH_RESOLUTION_SENSOR` may work but are untested.
 
 ## How It Works
 
@@ -191,16 +206,20 @@ The INMO Air3's camera HAL (Hardware Abstraction Layer) exposes two stream confi
 
 Standard camera apps only query the default map. FlashCam-Air3 queries the max-res map and uses `SENSOR_PIXEL_MODE = MAXIMUM_RESOLUTION` in both the session configuration and capture requests to access the full sensor resolution.
 
-### Portrait Mode Implementation
+### Orientation Handling
 
-Portrait mode does **not** rotate the entire sensor output. Instead:
+The Air3 is a landscape-locked device with `sensorOrientation = 270°`. The correct rotation to make the sensor buffer upright on the display is:
 
-1. The camera captures a full landscape frame (e.g., 4608×3456)
-2. A center-crop extracts a 3:4 region (e.g., 2592×3456) from the middle
-3. The cropped region is rotated 90° CW to produce a portrait image (3456×2592)
-4. The result is saved as a standard portrait JPEG with EXIF orientation NORMAL
+```
+uprightDegrees = (displayDegrees - sensorOrientation + 360) % 360
+```
 
-This approach preserves maximum image quality — no interpolation, no stretching, just a clean geometric crop and rotation.
+This single formula is used for:
+- **Preview transform** — rotating and scaling the TextureView buffer to match reality
+- **JPEG pixel rotation** — physically rotating the captured JPEG pixels before saving
+- **Video orientation hint** — setting `MediaRecorder.setOrientationHint()`
+
+`JPEG_ORIENTATION` is always set to 0 (the sensor encoder is not trusted to rotate). All rotation is done in software after capture.
 
 ## Troubleshooting
 
@@ -208,12 +227,10 @@ This approach preserves maximum image quality — no interpolation, no stretchin
 |-------|---------|
 | "Camera open failed" | Close all other camera apps, reboot the Air3, try again |
 | Max-res capture times out | Ensure no other app is using the camera; reboot |
-| Images appear sideways | Update to v1.5.1+; software pixel rotation with auto-correct should handle this |
+| Images appear sideways | Update to v1.6.0; the inverse rotation formula should fix this |
 | DNG won't open in editor | Ensure you're using a DNG-compatible editor (Lightroom, RawTherapee, etc.) |
 | App crashes on launch | Ensure Camera permission is granted in Settings > Apps > FlashCam-Air3 |
-| Preview shows black bars | Normal — letterbox/pillarbox areas are outside the capture frame |
-| Orange square on shutter | Update to v1.4+; this was a UI bug fixed in the shutter animation |
-| Portrait image has wrong aspect | Update to v1.5.1+; portrait is now a center-crop to 3:4 |
+| Preview shows black bars | Normal — letterbox/pillarbox areas are outside the 4:3 sensor frame |
 | "SENSOR_PIXEL_MODE not supported" | The HAL may not support this API; the app falls back to default mode |
 
 ## License
