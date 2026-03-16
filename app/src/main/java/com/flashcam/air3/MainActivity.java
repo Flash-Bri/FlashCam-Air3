@@ -59,9 +59,22 @@ import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Date;
+import java.util.EnumMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.concurrent.Executor;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+import com.google.zxing.BarcodeFormat;
+import com.google.zxing.BinaryBitmap;
+import com.google.zxing.DecodeHintType;
+import com.google.zxing.LuminanceSource;
+import com.google.zxing.MultiFormatReader;
+import com.google.zxing.NotFoundException;
+import com.google.zxing.PlanarYUVLuminanceSource;
+import com.google.zxing.Result;
+import com.google.zxing.common.HybridBinarizer;
 
 public class MainActivity extends AppCompatActivity {
 
@@ -86,6 +99,7 @@ public class MainActivity extends AppCompatActivity {
     private CameraDevice cameraDevice;
     private CameraCharacteristics camChars;
     private CameraCaptureSession previewSession;
+    private ImageReader qrAnalysisReader;
     private String cameraId;
     private int sensorOrientation = 0;
 
@@ -108,7 +122,7 @@ public class MainActivity extends AppCompatActivity {
     private View shutterFlashOverlay;
     private View focusRing;
     private TextView tvStatus, tvMode, tvFocusIndicator, tvEv;
-    private TextView tvReceipt;
+    private TextView tvReceipt, tvQrResult;
     private ImageButton btnShutter;
     private Button btnMode, btnDng, btnDebug, btnCredits;
     private Button btnEvPlus, btnEvMinus;
@@ -123,6 +137,13 @@ public class MainActivity extends AppCompatActivity {
     // ── Receipt log ──
     private String lastReceipt = "";
     private final List<String> receiptLog = new ArrayList<>();
+
+    // ── Minimal QR slice state ──
+    private final MultiFormatReader qrReader = new MultiFormatReader();
+    private final AtomicBoolean qrDecodeInFlight = new AtomicBoolean(false);
+    private long lastQrDecodeAtMs = 0;
+    private String lastQrText = "";
+    private static final long QR_DECODE_THROTTLE_MS = 300;
 
     // ================================================================
     // LIFECYCLE
@@ -145,6 +166,10 @@ public class MainActivity extends AppCompatActivity {
         workerHandler = new Handler(workerThread.getLooper());
 
         camManager = (CameraManager) getSystemService(Context.CAMERA_SERVICE);
+
+        Map<DecodeHintType, Object> hints = new EnumMap<>(DecodeHintType.class);
+        hints.put(DecodeHintType.POSSIBLE_FORMATS, Arrays.asList(BarcodeFormat.QR_CODE));
+        qrReader.setHints(hints);
 
         checkPermissions();
     }
@@ -182,6 +207,7 @@ public class MainActivity extends AppCompatActivity {
         tvFocusIndicator = findViewById(R.id.tvFocusIndicator);
         tvEv = findViewById(R.id.tvEv);
         tvReceipt = findViewById(R.id.tvReceipt);
+        tvQrResult = findViewById(R.id.tvQrResult);
         btnShutter = findViewById(R.id.btnShutter);
         btnMode = findViewById(R.id.btnMode);
         btnDng = findViewById(R.id.btnDng);
@@ -424,7 +450,9 @@ public class MainActivity extends AppCompatActivity {
     private void closeCamera() {
         try {
             if (previewSession != null) { previewSession.close(); previewSession = null; }
+            if (qrAnalysisReader != null) { qrAnalysisReader.close(); qrAnalysisReader = null; }
             if (cameraDevice != null) { cameraDevice.close(); cameraDevice = null; }
+            qrDecodeInFlight.set(false);
         } catch (Exception ignored) {}
     }
 
@@ -442,16 +470,24 @@ public class MainActivity extends AppCompatActivity {
             st.setDefaultBufferSize(ps.getWidth(), ps.getHeight());
             Surface previewSurface = new Surface(st);
 
+            if (qrAnalysisReader != null) { qrAnalysisReader.close(); qrAnalysisReader = null; }
+            qrAnalysisReader = ImageReader.newInstance(
+                ps.getWidth(), ps.getHeight(), ImageFormat.YUV_420_888, 2);
+            qrAnalysisReader.setOnImageAvailableListener(this::onQrFrameAvailable, camHandler);
+
             CaptureRequest.Builder previewBuilder =
                 cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
             previewBuilder.addTarget(previewSurface);
+            previewBuilder.addTarget(qrAnalysisReader.getSurface());
             previewBuilder.set(CaptureRequest.CONTROL_AF_MODE,
                 CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE);
             previewBuilder.set(CaptureRequest.CONTROL_AE_MODE,
                 CaptureRequest.CONTROL_AE_MODE_ON);
             previewBuilder.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, currentEv);
 
-            List<OutputConfiguration> outputs = Arrays.asList(new OutputConfiguration(previewSurface));
+            List<OutputConfiguration> outputs = Arrays.asList(
+                new OutputConfiguration(previewSurface),
+                new OutputConfiguration(qrAnalysisReader.getSurface()));
             Executor prevExec = camHandler::post;
 
             final Object sessLock = new Object();
@@ -492,12 +528,86 @@ public class MainActivity extends AppCompatActivity {
                 btnShutter.setEnabled(true);
                 configurePreviewTransform(textureView.getWidth(), textureView.getHeight());
                 updateModeDisplay();
+                updateQrOverlayText(lastQrText.isEmpty() ? "QR: scanning..." : "QR: " + lastQrText);
             });
 
         } catch (Exception e) {
             setStatusForced("Preview error: " + e.getMessage());
             transitionState(CamState.ERROR);
         }
+    }
+
+    // ================================================================
+    // QR PREVIEW ANALYSIS (MINIMAL SLICE)
+    // ================================================================
+    private void onQrFrameAvailable(ImageReader reader) {
+        Image image = reader.acquireLatestImage();
+        if (image == null) return;
+
+        long now = System.currentTimeMillis();
+        if (capturing || now - lastQrDecodeAtMs < QR_DECODE_THROTTLE_MS || !qrDecodeInFlight.compareAndSet(false, true)) {
+            image.close();
+            return;
+        }
+        lastQrDecodeAtMs = now;
+
+        final int width = image.getWidth();
+        final int height = image.getHeight();
+        final byte[] yData = copyYPlane(image);
+        image.close();
+
+        workerHandler.post(() -> {
+            try {
+                String decoded = tryDecodeQr(yData, width, height);
+                if (decoded != null && !decoded.isEmpty()) {
+                    lastQrText = decoded;
+                    mainHandler.post(() -> updateQrOverlayText("QR: " + decoded));
+                }
+            } catch (Exception ignored) {
+            } finally {
+                qrDecodeInFlight.set(false);
+            }
+        });
+    }
+
+    private String tryDecodeQr(byte[] yData, int width, int height) {
+        try {
+            LuminanceSource src = new PlanarYUVLuminanceSource(
+                yData, width, height, 0, 0, width, height, false);
+            BinaryBitmap bmp = new BinaryBitmap(new HybridBinarizer(src));
+            Result r = qrReader.decodeWithState(bmp);
+            qrReader.reset();
+            return r != null ? r.getText() : null;
+        } catch (NotFoundException nf) {
+            qrReader.reset();
+            return null;
+        } catch (Exception e) {
+            qrReader.reset();
+            return null;
+        }
+    }
+
+    private byte[] copyYPlane(Image image) {
+        Image.Plane plane = image.getPlanes()[0];
+        ByteBuffer buffer = plane.getBuffer();
+        int width = image.getWidth();
+        int height = image.getHeight();
+        int rowStride = plane.getRowStride();
+
+        byte[] out = new byte[width * height];
+        byte[] row = new byte[rowStride];
+        int offset = 0;
+        for (int y = 0; y < height; y++) {
+            int len = Math.min(rowStride, buffer.remaining());
+            buffer.get(row, 0, len);
+            System.arraycopy(row, 0, out, offset, Math.min(width, len));
+            offset += width;
+        }
+        return out;
+    }
+
+    private void updateQrOverlayText(String text) {
+        if (tvQrResult != null) tvQrResult.setText(text);
     }
 
     // ================================================================
@@ -670,6 +780,10 @@ public class MainActivity extends AppCompatActivity {
                 previewSession.close();
                 previewSession = null;
                 Thread.sleep(200);
+            }
+            if (qrAnalysisReader != null) {
+                qrAnalysisReader.close();
+                qrAnalysisReader = null;
             }
 
             // Determine capture size
