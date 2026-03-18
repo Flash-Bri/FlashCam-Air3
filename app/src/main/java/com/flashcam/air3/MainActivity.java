@@ -110,6 +110,7 @@ public class MainActivity extends AppCompatActivity {
     // ── Sizes ──
     private Size previewSize;
     private Size qrAnalysisSize;
+    private Size[] yuvOutputSizes;
     private Size[] defaultJpegSizes;
     private Size[] maxResJpegSizes;
     private Size[] maxResRawSizes;
@@ -391,7 +392,8 @@ public class MainActivity extends AppCompatActivity {
             if (defaultMap != null) {
                 defaultJpegSizes = defaultMap.getOutputSizes(ImageFormat.JPEG);
                 previewSize = findBest43Preview(defaultMap.getOutputSizes(SurfaceTexture.class));
-                qrAnalysisSize = findBestQrAnalysisSize(defaultMap.getOutputSizes(ImageFormat.YUV_420_888), previewSize);
+                yuvOutputSizes = defaultMap.getOutputSizes(ImageFormat.YUV_420_888);
+                qrAnalysisSize = findBestQrAnalysisSize(yuvOutputSizes, previewSize);
             }
 
             logCameraDiagnostics();
@@ -659,20 +661,33 @@ public class MainActivity extends AppCompatActivity {
         LuminanceSource src = new PlanarYUVLuminanceSource(
             yData, width, height, left, top, regionWidth, regionHeight, false);
 
-        String hybrid = decodeBitmap(new BinaryBitmap(new HybridBinarizer(src)));
+        String hybrid = decodeBitmap(new BinaryBitmap(new HybridBinarizer(src)),
+            "hybrid", left, top, regionWidth, regionHeight, width, height);
         if (hybrid != null) return hybrid;
 
-        String global = decodeBitmap(new BinaryBitmap(new GlobalHistogramBinarizer(src)));
+        String global = decodeBitmap(new BinaryBitmap(new GlobalHistogramBinarizer(src)),
+            "global", left, top, regionWidth, regionHeight, width, height);
         if (global != null) return global;
 
         return null;
     }
 
-    private String decodeBitmap(BinaryBitmap bmp) {
+    private String decodeBitmap(BinaryBitmap bmp,
+                                String mode,
+                                int regionLeft,
+                                int regionTop,
+                                int regionWidth,
+                                int regionHeight,
+                                int frameWidth,
+                                int frameHeight) {
         try {
             Result r = qrReader.decodeWithState(bmp);
             qrReader.reset();
-            return r != null ? r.getText() : null;
+            if (r != null) {
+                logDecodeSuccess(r, mode, regionLeft, regionTop, regionWidth, regionHeight, frameWidth, frameHeight);
+                return r.getText();
+            }
+            return null;
         } catch (NotFoundException nf) {
             qrReader.reset();
             return null;
@@ -680,6 +695,40 @@ public class MainActivity extends AppCompatActivity {
             qrReader.reset();
             return null;
         }
+    }
+
+    private void logDecodeSuccess(Result result,
+                                  String mode,
+                                  int regionLeft,
+                                  int regionTop,
+                                  int regionWidth,
+                                  int regionHeight,
+                                  int frameWidth,
+                                  int frameHeight) {
+        try {
+            com.google.zxing.ResultPoint[] pts = result.getResultPoints();
+            float minX = Float.MAX_VALUE, minY = Float.MAX_VALUE;
+            float maxX = Float.MIN_VALUE, maxY = Float.MIN_VALUE;
+            if (pts != null) {
+                for (com.google.zxing.ResultPoint p : pts) {
+                    if (p == null) continue;
+                    float x = p.getX() + regionLeft;
+                    float y = p.getY() + regionTop;
+                    minX = Math.min(minX, x);
+                    maxX = Math.max(maxX, x);
+                    minY = Math.min(minY, y);
+                    maxY = Math.max(maxY, y);
+                }
+            }
+            float spanW = (maxX > minX) ? (maxX - minX) : -1f;
+            float spanH = (maxY > minY) ? (maxY - minY) : -1f;
+            float pctW = spanW > 0 ? (100f * spanW / frameWidth) : -1f;
+            float pctH = spanH > 0 ? (100f * spanH / frameHeight) : -1f;
+            Log.i(TAG, String.format(Locale.US,
+                "QR decode success mode=%s frame=%dx%d region=%d,%d %dx%d qrSpan=%.1fx%.1fpx (%.1f%% x %.1f%%)",
+                mode, frameWidth, frameHeight, regionLeft, regionTop, regionWidth, regionHeight,
+                spanW, spanH, pctW, pctH));
+        } catch (Exception ignored) {}
     }
 
     private byte[] copyYPlane(Image image) {
@@ -914,8 +963,11 @@ public class MainActivity extends AppCompatActivity {
             Integer maxAfRegions = camChars.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AF);
             Integer maxAeRegions = camChars.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AE);
             Float minFocusDistance = camChars.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE);
+            android.graphics.Rect activeArray = camChars.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE);
             Log.i(TAG, "Camera diag: preview=" + fmtSize(previewSize)
                 + " analysis=" + fmtSize(qrAnalysisSize)
+                + " sensorActive=" + (activeArray != null ? activeArray.toShortString() : "?")
+                + " yuvSizes=" + fmtSizeList(yuvOutputSizes)
                 + " afModes=" + Arrays.toString(afModes)
                 + " maxAFRegions=" + maxAfRegions
                 + " maxAERegions=" + maxAeRegions
@@ -1668,6 +1720,19 @@ public class MainActivity extends AppCompatActivity {
     // ================================================================
     private String fmtSize(Size s) {
         return s != null ? s.getWidth() + "x" + s.getHeight() : "?";
+    }
+
+    private String fmtSizeList(Size[] sizes) {
+        if (sizes == null || sizes.length == 0) return "[]";
+        StringBuilder sb = new StringBuilder("[");
+        int shown = Math.min(sizes.length, 12);
+        for (int i = 0; i < shown; i++) {
+            if (i > 0) sb.append(",");
+            sb.append(fmtSize(sizes[i]));
+        }
+        if (sizes.length > shown) sb.append(",...");
+        sb.append("]");
+        return sb.toString();
     }
 
     private Size findBestQrAnalysisSize(Size[] yuvSizes, Size fallback) {
