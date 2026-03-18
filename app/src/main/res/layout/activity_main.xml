@@ -66,6 +66,53 @@
             android:paddingStart="8dp" />
     </LinearLayout>
 
+    <!-- QR status/action strip -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top"
+        android:layout_marginTop="42dp"
+        android:orientation="horizontal"
+        android:gravity="center_vertical"
+        android:paddingStart="8dp"
+        android:paddingEnd="8dp"
+        android:paddingTop="4dp"
+        android:paddingBottom="4dp"
+        android:background="#66000000">
+
+        <TextView
+            android:id="@+id/tvQrResult"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:maxLines="1"
+            android:ellipsize="end"
+            android:text="QR: off"
+            android:textColor="#FF7CFF7C"
+            android:textSize="11sp" />
+
+        <Button
+            android:id="@+id/btnQrOpen"
+            android:layout_width="wrap_content"
+            android:layout_height="30dp"
+            android:layout_marginEnd="6dp"
+            android:text="OPEN"
+            android:textSize="9sp"
+            android:textColor="#FF000000"
+            android:backgroundTint="#FF7CFF7C"
+            android:visibility="gone" />
+
+        <Button
+            android:id="@+id/btnQrCopy"
+            android:layout_width="wrap_content"
+            android:layout_height="30dp"
+            android:text="COPY"
+            android:textSize="9sp"
+            android:textColor="#FFFFFFFF"
+            android:backgroundTint="#FF333333"
+            android:visibility="gone" />
+    </LinearLayout>
+
     <!-- Left controls: EV, Debug, Credits -->
     <LinearLayout
         android:layout_width="wrap_content"
@@ -148,6 +195,16 @@
             android:layout_width="56dp"
             android:layout_height="40dp"
             android:text="DNG:OFF"
+            android:textColor="#FFFFFFFF"
+            android:textSize="9sp"
+            android:backgroundTint="#FF333333"
+            android:layout_marginBottom="4dp" />
+
+        <Button
+            android:id="@+id/btnQrMode"
+            android:layout_width="56dp"
+            android:layout_height="40dp"
+            android:text="QR:OFF"
             android:textColor="#FFFFFFFF"
             android:textSize="9sp"
             android:backgroundTint="#FF333333"
