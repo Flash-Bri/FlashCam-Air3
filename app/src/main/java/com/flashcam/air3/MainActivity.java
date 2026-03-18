@@ -154,6 +154,7 @@ public class MainActivity extends AppCompatActivity {
     private int qrCandidateHits = 0;
     private int qrMissCount = 0;
     private String stableQrText = "";
+    private int qrRegionCursor = 0;
     private static final long QR_DECODE_THROTTLE_MS = 200;
     private static final int QR_STABLE_HITS_REQUIRED = 2;
     private static final int QR_CLEAR_MISS_COUNT = 12;
@@ -593,15 +594,68 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private String tryDecodeQr(byte[] yData, int width, int height) {
-        // Prefer center ROI first for on-screen/phone QR reliability, then fallback full-frame.
-        String roi = decodeQrRegion(yData, width, height,
-            width / 5, height / 5, (width * 3) / 5, (height * 3) / 5);
-        if (roi != null && !roi.isEmpty()) return roi;
-        return decodeQrRegion(yData, width, height, 0, 0, width, height);
+        // Pass 1: full frame catches obvious/large targets anywhere.
+        String full = decodeQrRegion(yData, width, height, 0, 0, width, height);
+        if (full != null && !full.isEmpty()) return full;
+
+        // Pass 2: centered mid crop boosts module size for medium/small center targets.
+        String center = decodeQrRegion(yData, width, height,
+            width / 6, height / 6, (width * 2) / 3, (height * 2) / 3);
+        if (center != null && !center.isEmpty()) return center;
+
+        // Pass 3+: rotating regional coverage so smaller clear QR can be found away from center.
+        // Large window (coverage) then tighter window (effective digital zoom) at same anchor.
+        int[][] anchors = buildGridAnchors(width, height, 3, 3);
+        if (anchors.length == 0) return null;
+
+        int idx = qrRegionCursor % anchors.length;
+        qrRegionCursor = (qrRegionCursor + 1) % anchors.length;
+
+        int ax = anchors[idx][0];
+        int ay = anchors[idx][1];
+
+        int largeW = (width * 3) / 5;
+        int largeH = (height * 3) / 5;
+        String regional = decodeQrRegion(yData, width, height, ax, ay, largeW, largeH);
+        if (regional != null && !regional.isEmpty()) return regional;
+
+        int tightW = width / 2;
+        int tightH = height / 2;
+        String tight = decodeQrRegion(yData, width, height, ax, ay, tightW, tightH);
+        if (tight != null && !tight.isEmpty()) return tight;
+
+        return null;
+    }
+
+    private int[][] buildGridAnchors(int width, int height, int cols, int rows) {
+        int[][] out = new int[cols * rows][2];
+        int i = 0;
+
+        int maxLeftLarge = Math.max(0, width - (width * 3) / 5);
+        int maxTopLarge = Math.max(0, height - (height * 3) / 5);
+
+        for (int r = 0; r < rows; r++) {
+            float ry = rows == 1 ? 0f : (float) r / (rows - 1);
+            int top = (int) (ry * maxTopLarge);
+            for (int c = 0; c < cols; c++) {
+                float cx = cols == 1 ? 0f : (float) c / (cols - 1);
+                int left = (int) (cx * maxLeftLarge);
+                out[i][0] = left;
+                out[i][1] = top;
+                i++;
+            }
+        }
+
+        return out;
     }
 
     private String decodeQrRegion(byte[] yData, int width, int height,
                                   int left, int top, int regionWidth, int regionHeight) {
+        if (regionWidth <= 0 || regionHeight <= 0) return null;
+        if (left < 0) left = 0;
+        if (top < 0) top = 0;
+        if (left + regionWidth > width) left = Math.max(0, width - regionWidth);
+        if (top + regionHeight > height) top = Math.max(0, height - regionHeight);
         LuminanceSource src = new PlanarYUVLuminanceSource(
             yData, width, height, left, top, regionWidth, regionHeight, false);
 
@@ -693,6 +747,7 @@ public class MainActivity extends AppCompatActivity {
         qrCandidateText = "";
         qrCandidateHits = 0;
         qrMissCount = 0;
+        qrRegionCursor = 0;
         stableQrText = "";
         if (!enabled) {
             activeFocusRegions = null;
