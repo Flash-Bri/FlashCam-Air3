@@ -1,10 +1,12 @@
 package com.flashcam.air3;
 
 import android.Manifest;
+import android.content.ActivityNotFoundException;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.ContentValues;
 import android.content.Context;
+import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
@@ -31,6 +33,7 @@ import android.os.HandlerThread;
 import android.os.Looper;
 import android.provider.MediaStore;
 import android.util.Log;
+import android.util.Patterns;
 import android.util.Size;
 import android.view.Surface;
 import android.view.TextureView;
@@ -127,6 +130,7 @@ public class MainActivity extends AppCompatActivity {
     private Button btnMode, btnDng, btnDebug, btnCredits;
     private Button btnEvPlus, btnEvMinus;
     private Button btnCopyReceipt, btnExportLog, btnDismiss;
+    private Button btnQrMode, btnQrOpen, btnQrCopy;
     private LinearLayout receiptPanel;
 
     // ── State machine ──
@@ -142,8 +146,14 @@ public class MainActivity extends AppCompatActivity {
     private final MultiFormatReader qrReader = new MultiFormatReader();
     private final AtomicBoolean qrDecodeInFlight = new AtomicBoolean(false);
     private long lastQrDecodeAtMs = 0;
-    private String lastQrText = "";
+    private boolean qrModeEnabled = false;
+    private String qrCandidateText = "";
+    private int qrCandidateHits = 0;
+    private int qrMissCount = 0;
+    private String stableQrText = "";
     private static final long QR_DECODE_THROTTLE_MS = 300;
+    private static final int QR_STABLE_HITS_REQUIRED = 2;
+    private static final int QR_CLEAR_MISS_COUNT = 8;
 
     // ================================================================
     // LIFECYCLE
@@ -156,6 +166,7 @@ public class MainActivity extends AppCompatActivity {
 
         bindViews();
         setupListeners();
+        updateQrUi();
 
         camThread = new HandlerThread("CamThread");
         camThread.start();
@@ -218,6 +229,9 @@ public class MainActivity extends AppCompatActivity {
         btnCopyReceipt = findViewById(R.id.btnCopyReceipt);
         btnExportLog = findViewById(R.id.btnExportLog);
         btnDismiss = findViewById(R.id.btnDismiss);
+        btnQrMode = findViewById(R.id.btnQrMode);
+        btnQrOpen = findViewById(R.id.btnQrOpen);
+        btnQrCopy = findViewById(R.id.btnQrCopy);
         receiptPanel = findViewById(R.id.receiptPanel);
     }
 
@@ -270,6 +284,10 @@ public class MainActivity extends AppCompatActivity {
 
         btnEvPlus.setOnClickListener(v -> adjustEv(1));
         btnEvMinus.setOnClickListener(v -> adjustEv(-1));
+
+        btnQrMode.setOnClickListener(v -> setQrModeEnabled(!qrModeEnabled));
+        btnQrOpen.setOnClickListener(v -> openQrValue());
+        btnQrCopy.setOnClickListener(v -> copyQrValue());
 
         btnDebug.setOnClickListener(v -> {
             debugEnabled = !debugEnabled;
@@ -528,7 +546,7 @@ public class MainActivity extends AppCompatActivity {
                 btnShutter.setEnabled(true);
                 configurePreviewTransform(textureView.getWidth(), textureView.getHeight());
                 updateModeDisplay();
-                updateQrOverlayText(lastQrText.isEmpty() ? "QR: scanning..." : "QR: " + lastQrText);
+                updateQrUi();
             });
 
         } catch (Exception e) {
@@ -545,7 +563,8 @@ public class MainActivity extends AppCompatActivity {
         if (image == null) return;
 
         long now = System.currentTimeMillis();
-        if (capturing || now - lastQrDecodeAtMs < QR_DECODE_THROTTLE_MS || !qrDecodeInFlight.compareAndSet(false, true)) {
+        if (!qrModeEnabled || capturing || now - lastQrDecodeAtMs < QR_DECODE_THROTTLE_MS
+            || !qrDecodeInFlight.compareAndSet(false, true)) {
             image.close();
             return;
         }
@@ -559,10 +578,7 @@ public class MainActivity extends AppCompatActivity {
         workerHandler.post(() -> {
             try {
                 String decoded = tryDecodeQr(yData, width, height);
-                if (decoded != null && !decoded.isEmpty()) {
-                    lastQrText = decoded;
-                    mainHandler.post(() -> updateQrOverlayText("QR: " + decoded));
-                }
+                handleQrDecodeResult(decoded);
             } catch (Exception ignored) {
             } finally {
                 qrDecodeInFlight.set(false);
@@ -571,9 +587,18 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private String tryDecodeQr(byte[] yData, int width, int height) {
+        // Prefer center ROI first for on-screen/phone QR reliability, then fallback full-frame.
+        String roi = decodeQrRegion(yData, width, height,
+            width / 5, height / 5, (width * 3) / 5, (height * 3) / 5);
+        if (roi != null && !roi.isEmpty()) return roi;
+        return decodeQrRegion(yData, width, height, 0, 0, width, height);
+    }
+
+    private String decodeQrRegion(byte[] yData, int width, int height,
+                                  int left, int top, int regionWidth, int regionHeight) {
         try {
             LuminanceSource src = new PlanarYUVLuminanceSource(
-                yData, width, height, 0, 0, width, height, false);
+                yData, width, height, left, top, regionWidth, regionHeight, false);
             BinaryBitmap bmp = new BinaryBitmap(new HybridBinarizer(src));
             Result r = qrReader.decodeWithState(bmp);
             qrReader.reset();
@@ -606,8 +631,92 @@ public class MainActivity extends AppCompatActivity {
         return out;
     }
 
-    private void updateQrOverlayText(String text) {
-        if (tvQrResult != null) tvQrResult.setText(text);
+    private void handleQrDecodeResult(String decoded) {
+        if (!qrModeEnabled) return;
+
+        if (decoded == null || decoded.isEmpty()) {
+            qrMissCount++;
+            if (qrMissCount >= QR_CLEAR_MISS_COUNT && !stableQrText.isEmpty()) {
+                stableQrText = "";
+                qrCandidateText = "";
+                qrCandidateHits = 0;
+                mainHandler.post(this::updateQrUi);
+            }
+            return;
+        }
+
+        qrMissCount = 0;
+        if (decoded.equals(qrCandidateText)) {
+            qrCandidateHits++;
+        } else {
+            qrCandidateText = decoded;
+            qrCandidateHits = 1;
+        }
+
+        if (qrCandidateHits >= QR_STABLE_HITS_REQUIRED && !decoded.equals(stableQrText)) {
+            stableQrText = decoded;
+            mainHandler.post(this::updateQrUi);
+        }
+    }
+
+    private void setQrModeEnabled(boolean enabled) {
+        qrModeEnabled = enabled;
+        qrCandidateText = "";
+        qrCandidateHits = 0;
+        qrMissCount = 0;
+        stableQrText = "";
+        updateQrUi();
+    }
+
+    private void updateQrUi() {
+        if (btnQrMode != null) {
+            btnQrMode.setText(qrModeEnabled ? "QR:ON" : "QR:OFF");
+            btnQrMode.setBackgroundTintList(android.content.res.ColorStateList.valueOf(
+                qrModeEnabled ? COLOR_ORANGE : 0xFF333333));
+        }
+
+        if (tvQrResult != null) {
+            if (!qrModeEnabled) {
+                tvQrResult.setText("QR: off");
+            } else if (stableQrText.isEmpty()) {
+                tvQrResult.setText("QR: ready");
+            } else {
+                tvQrResult.setText("QR: " + stableQrText);
+            }
+        }
+
+        boolean hasValue = qrModeEnabled && !stableQrText.isEmpty();
+        if (btnQrCopy != null) btnQrCopy.setVisibility(hasValue ? View.VISIBLE : View.GONE);
+
+        boolean url = hasValue && isLikelyUrl(stableQrText);
+        if (btnQrOpen != null) btnQrOpen.setVisibility(url ? View.VISIBLE : View.GONE);
+    }
+
+    private boolean isLikelyUrl(String value) {
+        return value != null
+            && (value.startsWith("http://") || value.startsWith("https://"))
+            && Patterns.WEB_URL.matcher(value).matches();
+    }
+
+    private void openQrValue() {
+        if (!isLikelyUrl(stableQrText)) return;
+        try {
+            Intent i = new Intent(Intent.ACTION_VIEW, Uri.parse(stableQrText));
+            startActivity(i);
+        } catch (ActivityNotFoundException e) {
+            Toast.makeText(this, "No app can open this link", Toast.LENGTH_SHORT).show();
+        } catch (Exception e) {
+            Toast.makeText(this, "Open failed", Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    private void copyQrValue() {
+        if (stableQrText == null || stableQrText.isEmpty()) return;
+        ClipboardManager cb = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+        if (cb != null) {
+            cb.setPrimaryClip(ClipData.newPlainText("FlashCam QR", stableQrText));
+            Toast.makeText(this, "QR copied", Toast.LENGTH_SHORT).show();
+        }
     }
 
     // ================================================================
