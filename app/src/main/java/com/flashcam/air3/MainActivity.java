@@ -109,6 +109,7 @@ public class MainActivity extends AppCompatActivity {
 
     // ── Sizes ──
     private Size previewSize;
+    private Size qrAnalysisSize;
     private Size[] defaultJpegSizes;
     private Size[] maxResJpegSizes;
     private Size[] maxResRawSizes;
@@ -153,9 +154,14 @@ public class MainActivity extends AppCompatActivity {
     private int qrCandidateHits = 0;
     private int qrMissCount = 0;
     private String stableQrText = "";
-    private static final long QR_DECODE_THROTTLE_MS = 300;
+    private static final long QR_DECODE_THROTTLE_MS = 200;
     private static final int QR_STABLE_HITS_REQUIRED = 2;
-    private static final int QR_CLEAR_MISS_COUNT = 8;
+    private static final int QR_CLEAR_MISS_COUNT = 12;
+
+    // ── Focus/metering hold state ──
+    private MeteringRectangle[] activeFocusRegions = null;
+    private long focusRegionHoldUntilMs = 0;
+    private static final long FOCUS_REGION_HOLD_MS = 3500;
 
     // ================================================================
     // LIFECYCLE
@@ -182,6 +188,7 @@ public class MainActivity extends AppCompatActivity {
 
         Map<DecodeHintType, Object> hints = new EnumMap<>(DecodeHintType.class);
         hints.put(DecodeHintType.POSSIBLE_FORMATS, Arrays.asList(BarcodeFormat.QR_CODE));
+        hints.put(DecodeHintType.TRY_HARDER, Boolean.TRUE);
         qrReader.setHints(hints);
 
         checkPermissions();
@@ -383,7 +390,10 @@ public class MainActivity extends AppCompatActivity {
             if (defaultMap != null) {
                 defaultJpegSizes = defaultMap.getOutputSizes(ImageFormat.JPEG);
                 previewSize = findBest43Preview(defaultMap.getOutputSizes(SurfaceTexture.class));
+                qrAnalysisSize = findBestQrAnalysisSize(defaultMap.getOutputSizes(ImageFormat.YUV_420_888), previewSize);
             }
+
+            logCameraDiagnostics();
 
             // Max-res stream map (API 31+)
             try {
@@ -491,20 +501,13 @@ public class MainActivity extends AppCompatActivity {
             st.setDefaultBufferSize(ps.getWidth(), ps.getHeight());
             Surface previewSurface = new Surface(st);
 
+            Size analysisSize = qrAnalysisSize != null ? qrAnalysisSize : ps;
             if (qrAnalysisReader != null) { qrAnalysisReader.close(); qrAnalysisReader = null; }
             qrAnalysisReader = ImageReader.newInstance(
-                ps.getWidth(), ps.getHeight(), ImageFormat.YUV_420_888, 2);
+                analysisSize.getWidth(), analysisSize.getHeight(), ImageFormat.YUV_420_888, 2);
             qrAnalysisReader.setOnImageAvailableListener(this::onQrFrameAvailable, camHandler);
 
-            CaptureRequest.Builder previewBuilder =
-                cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
-            previewBuilder.addTarget(previewSurface);
-            previewBuilder.addTarget(qrAnalysisReader.getSurface());
-            previewBuilder.set(CaptureRequest.CONTROL_AF_MODE,
-                CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE);
-            previewBuilder.set(CaptureRequest.CONTROL_AE_MODE,
-                CaptureRequest.CONTROL_AE_MODE_ON);
-            previewBuilder.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, currentEv);
+            CaptureRequest.Builder previewBuilder = buildPreviewRequestBuilder(previewSurface, null, false);
 
             List<OutputConfiguration> outputs = Arrays.asList(
                 new OutputConfiguration(previewSurface),
@@ -691,7 +694,12 @@ public class MainActivity extends AppCompatActivity {
         qrCandidateHits = 0;
         qrMissCount = 0;
         stableQrText = "";
+        if (!enabled) {
+            activeFocusRegions = null;
+            focusRegionHoldUntilMs = 0;
+        }
         updateQrUi();
+        applyPreviewRepeatingRequest();
     }
 
     private void updateQrUi() {
@@ -747,6 +755,118 @@ public class MainActivity extends AppCompatActivity {
         if (cb != null) {
             cb.setPrimaryClip(ClipData.newPlainText("FlashCam QR", stableQrText));
             Toast.makeText(this, "QR copied", Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    private CaptureRequest.Builder buildPreviewRequestBuilder(Surface previewSurface,
+                                                              Integer afTrigger,
+                                                              boolean preferTapFocus) throws CameraAccessException {
+        CaptureRequest.Builder b = cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
+        b.addTarget(previewSurface);
+        if (qrAnalysisReader != null) b.addTarget(qrAnalysisReader.getSurface());
+
+        long now = System.currentTimeMillis();
+        boolean holdFocusRegion = activeFocusRegions != null && now < focusRegionHoldUntilMs;
+        boolean useTapFocus = preferTapFocus || holdFocusRegion;
+
+        b.set(CaptureRequest.CONTROL_AF_MODE,
+            useTapFocus ? CaptureRequest.CONTROL_AF_MODE_AUTO
+                        : CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE);
+        b.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON);
+        b.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, currentEv);
+
+        if (holdFocusRegion) {
+            Integer maxAfRegions = camChars != null ? camChars.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AF) : 0;
+            Integer maxAeRegions = camChars != null ? camChars.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AE) : 0;
+            if (maxAfRegions != null && maxAfRegions > 0) {
+                b.set(CaptureRequest.CONTROL_AF_REGIONS, activeFocusRegions);
+            }
+            if (maxAeRegions != null && maxAeRegions > 0) {
+                b.set(CaptureRequest.CONTROL_AE_REGIONS, activeFocusRegions);
+            }
+        }
+
+        if (afTrigger != null) {
+            b.set(CaptureRequest.CONTROL_AF_TRIGGER, afTrigger);
+        }
+
+        return b;
+    }
+
+    private void applyPreviewRepeatingRequest() {
+        if (previewSession == null || cameraDevice == null) return;
+        try {
+            SurfaceTexture st = textureView.getSurfaceTexture();
+            if (st == null) return;
+            Size ps = previewSize != null ? previewSize : new Size(1440, 1080);
+            st.setDefaultBufferSize(ps.getWidth(), ps.getHeight());
+            Surface previewSurface = new Surface(st);
+            CaptureRequest.Builder b = buildPreviewRequestBuilder(previewSurface, null, false);
+            previewSession.setRepeatingRequest(b.build(), new CameraCaptureSession.CaptureCallback() {
+                @Override public void onCaptureCompleted(@NonNull CameraCaptureSession s,
+                        @NonNull CaptureRequest r, @NonNull TotalCaptureResult result) {
+                    updateFocusIndicator(result);
+                }
+            }, camHandler);
+        } catch (Exception e) {
+            Log.w(TAG, "applyPreviewRepeatingRequest error: " + e.getMessage());
+        }
+    }
+
+    private MeteringRectangle[] mapTapToMeteringRegions(float tx, float ty) {
+        int vw = textureView.getWidth();
+        int vh = textureView.getHeight();
+        if (vw == 0 || vh == 0 || previewSize == null || camChars == null) return null;
+
+        float pw = previewSize.getWidth();
+        float ph = previewSize.getHeight();
+        float fitScale = Math.min((float) vw / pw, (float) vh / ph);
+        float contentW = pw * fitScale;
+        float contentH = ph * fitScale;
+        float leftPad = (vw - contentW) / 2f;
+        float topPad = (vh - contentH) / 2f;
+
+        float cx = Math.max(leftPad, Math.min(leftPad + contentW, tx));
+        float cy = Math.max(topPad, Math.min(topPad + contentH, ty));
+
+        float nx = (cx - leftPad) / contentW;
+        float ny = (cy - topPad) / contentH;
+
+        android.graphics.Rect activeArray = camChars.get(
+            CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE);
+        if (activeArray == null) return null;
+
+        int aw = activeArray.width();
+        int ah = activeArray.height();
+        int regionSize = (int) (Math.max(aw, ah) * 0.12f);
+        int sensorX = activeArray.left + (int) (nx * aw);
+        int sensorY = activeArray.top + (int) (ny * ah);
+
+        int l = Math.max(activeArray.left, sensorX - regionSize / 2);
+        int t = Math.max(activeArray.top, sensorY - regionSize / 2);
+        int r = Math.min(activeArray.right, l + regionSize);
+        int b = Math.min(activeArray.bottom, t + regionSize);
+
+        return new MeteringRectangle[]{
+            new MeteringRectangle(l, t, r - l, b - t, 1000)
+        };
+    }
+
+    private void logCameraDiagnostics() {
+        if (camChars == null) return;
+        try {
+            int[] afModes = camChars.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES);
+            Integer maxAfRegions = camChars.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AF);
+            Integer maxAeRegions = camChars.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AE);
+            Float minFocusDistance = camChars.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE);
+            Log.i(TAG, "Camera diag: preview=" + fmtSize(previewSize)
+                + " analysis=" + fmtSize(qrAnalysisSize)
+                + " afModes=" + Arrays.toString(afModes)
+                + " maxAFRegions=" + maxAfRegions
+                + " maxAERegions=" + maxAeRegions
+                + " minFocusDistance=" + minFocusDistance);
+        } catch (Exception e) {
+            Log.w(TAG, "logCameraDiagnostics error: " + e.getMessage());
         }
     }
 
@@ -835,49 +955,33 @@ public class MainActivity extends AppCompatActivity {
                 focusRing.setVisibility(View.GONE)).start();
         });
 
-        // Map tap to sensor coordinates [0..1]
-        int vw = textureView.getWidth();
-        int vh = textureView.getHeight();
-        if (vw == 0 || vh == 0) return;
-
-        float nx = tx / vw;
-        float ny = ty / vh;
-
-        // Map to sensor active array
-        android.graphics.Rect activeArray = camChars.get(
-            CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE);
-        if (activeArray == null) return;
-
-        int aw = activeArray.width();
-        int ah = activeArray.height();
-        int regionSize = (int) (Math.max(aw, ah) * 0.1f);
-        int cx = (int) (nx * aw);
-        int cy = (int) (ny * ah);
-
-        int left = Math.max(0, cx - regionSize / 2);
-        int top = Math.max(0, cy - regionSize / 2);
-        int right = Math.min(aw, left + regionSize);
-        int bottom = Math.min(ah, top + regionSize);
-
-        MeteringRectangle[] regions = new MeteringRectangle[]{
-            new MeteringRectangle(left, top, right - left, bottom - top, 1000)
-        };
+        MeteringRectangle[] regions = mapTapToMeteringRegions(tx, ty);
+        if (regions == null) return;
 
         try {
-            CaptureRequest.Builder afBuilder =
-                cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
             SurfaceTexture st = textureView.getSurfaceTexture();
             if (st == null) return;
             Size ps = previewSize != null ? previewSize : new Size(1440, 1080);
             st.setDefaultBufferSize(ps.getWidth(), ps.getHeight());
-            afBuilder.addTarget(new Surface(st));
-            afBuilder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO);
-            afBuilder.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_START);
-            afBuilder.set(CaptureRequest.CONTROL_AF_REGIONS, regions);
-            afBuilder.set(CaptureRequest.CONTROL_AE_REGIONS, regions);
-            afBuilder.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, currentEv);
+            Surface previewSurface = new Surface(st);
 
-            previewSession.capture(afBuilder.build(), null, camHandler);
+            activeFocusRegions = regions;
+            focusRegionHoldUntilMs = System.currentTimeMillis() + FOCUS_REGION_HOLD_MS;
+
+            CaptureRequest.Builder triggerBuilder = buildPreviewRequestBuilder(
+                previewSurface, CaptureRequest.CONTROL_AF_TRIGGER_START, true);
+            previewSession.capture(triggerBuilder.build(), null, camHandler);
+
+            CaptureRequest.Builder holdBuilder = buildPreviewRequestBuilder(
+                previewSurface, CaptureRequest.CONTROL_AF_TRIGGER_IDLE, true);
+            previewSession.setRepeatingRequest(holdBuilder.build(), null, camHandler);
+
+            mainHandler.postDelayed(() -> {
+                if (System.currentTimeMillis() >= focusRegionHoldUntilMs) {
+                    activeFocusRegions = null;
+                    applyPreviewRepeatingRequest();
+                }
+            }, FOCUS_REGION_HOLD_MS + 100);
         } catch (Exception e) {
             Log.w(TAG, "Tap-to-focus error: " + e.getMessage());
         }
@@ -1391,21 +1495,7 @@ public class MainActivity extends AppCompatActivity {
 
         // Apply to current preview
         if (previewSession != null && cameraDevice != null && !capturing) {
-            try {
-                CaptureRequest.Builder b = cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
-                SurfaceTexture st = textureView.getSurfaceTexture();
-                if (st != null) {
-                    Size ps = previewSize != null ? previewSize : new Size(1440, 1080);
-                    st.setDefaultBufferSize(ps.getWidth(), ps.getHeight());
-                    b.addTarget(new Surface(st));
-                    b.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE);
-                    b.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON);
-                    b.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, currentEv);
-                    previewSession.setRepeatingRequest(b.build(), null, camHandler);
-                }
-            } catch (Exception e) {
-                Log.w(TAG, "EV adjust error: " + e.getMessage());
-            }
+            applyPreviewRepeatingRequest();
         }
     }
 
@@ -1523,6 +1613,26 @@ public class MainActivity extends AppCompatActivity {
     // ================================================================
     private String fmtSize(Size s) {
         return s != null ? s.getWidth() + "x" + s.getHeight() : "?";
+    }
+
+    private Size findBestQrAnalysisSize(Size[] yuvSizes, Size fallback) {
+        if (yuvSizes == null || yuvSizes.length == 0) return fallback;
+
+        // Prefer higher-detail 4:3 YUV (up to 1920x1440) for QR decode while keeping cost bounded.
+        Size best43 = null;
+        long best43Px = 0;
+        Size bestAny = null;
+        long bestAnyPx = 0;
+        for (Size s : yuvSizes) {
+            int w = s.getWidth(), h = s.getHeight();
+            long px = (long) w * h;
+            if (px > 1920L * 1440) continue;
+            float ratio = (float) w / h;
+            boolean is43 = Math.abs(ratio - 4f / 3f) < 0.02f;
+            if (is43 && px > best43Px) { best43 = s; best43Px = px; }
+            if (px > bestAnyPx) { bestAny = s; bestAnyPx = px; }
+        }
+        return best43 != null ? best43 : (bestAny != null ? bestAny : fallback);
     }
 
     private Size findLargest(Size[] sizes) {
