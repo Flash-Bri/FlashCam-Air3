@@ -77,6 +77,7 @@ import com.google.zxing.MultiFormatReader;
 import com.google.zxing.NotFoundException;
 import com.google.zxing.PlanarYUVLuminanceSource;
 import com.google.zxing.Result;
+import com.google.zxing.common.GlobalHistogramBinarizer;
 import com.google.zxing.common.HybridBinarizer;
 
 public class MainActivity extends AppCompatActivity {
@@ -124,6 +125,7 @@ public class MainActivity extends AppCompatActivity {
     private TextureView textureView;
     private View shutterFlashOverlay;
     private View focusRing;
+    private View qrStrip;
     private TextView tvStatus, tvMode, tvFocusIndicator, tvEv;
     private TextView tvReceipt, tvQrResult;
     private ImageButton btnShutter;
@@ -213,6 +215,7 @@ public class MainActivity extends AppCompatActivity {
         textureView = findViewById(R.id.textureView);
         shutterFlashOverlay = findViewById(R.id.shutterFlashOverlay);
         focusRing = findViewById(R.id.focusRing);
+        qrStrip = findViewById(R.id.qrStrip);
         tvStatus = findViewById(R.id.tvStatus);
         tvMode = findViewById(R.id.tvMode);
         tvFocusIndicator = findViewById(R.id.tvFocusIndicator);
@@ -596,10 +599,20 @@ public class MainActivity extends AppCompatActivity {
 
     private String decodeQrRegion(byte[] yData, int width, int height,
                                   int left, int top, int regionWidth, int regionHeight) {
+        LuminanceSource src = new PlanarYUVLuminanceSource(
+            yData, width, height, left, top, regionWidth, regionHeight, false);
+
+        String hybrid = decodeBitmap(new BinaryBitmap(new HybridBinarizer(src)));
+        if (hybrid != null) return hybrid;
+
+        String global = decodeBitmap(new BinaryBitmap(new GlobalHistogramBinarizer(src)));
+        if (global != null) return global;
+
+        return null;
+    }
+
+    private String decodeBitmap(BinaryBitmap bmp) {
         try {
-            LuminanceSource src = new PlanarYUVLuminanceSource(
-                yData, width, height, left, top, regionWidth, regionHeight, false);
-            BinaryBitmap bmp = new BinaryBitmap(new HybridBinarizer(src));
             Result r = qrReader.decodeWithState(bmp);
             qrReader.reset();
             return r != null ? r.getText() : null;
@@ -618,15 +631,28 @@ public class MainActivity extends AppCompatActivity {
         int width = image.getWidth();
         int height = image.getHeight();
         int rowStride = plane.getRowStride();
+        int pixelStride = plane.getPixelStride();
 
         byte[] out = new byte[width * height];
         byte[] row = new byte[rowStride];
-        int offset = 0;
+        int outOffset = 0;
+
         for (int y = 0; y < height; y++) {
-            int len = Math.min(rowStride, buffer.remaining());
-            buffer.get(row, 0, len);
-            System.arraycopy(row, 0, out, offset, Math.min(width, len));
-            offset += width;
+            int rowLen = Math.min(rowStride, buffer.remaining());
+            if (rowLen <= 0) break;
+            buffer.get(row, 0, rowLen);
+
+            if (pixelStride == 1) {
+                System.arraycopy(row, 0, out, outOffset, Math.min(width, rowLen));
+            } else {
+                for (int x = 0; x < width; x++) {
+                    int src = x * pixelStride;
+                    if (src < rowLen) {
+                        out[outOffset + x] = row[src];
+                    }
+                }
+            }
+            outOffset += width;
         }
         return out;
     }
@@ -670,22 +696,27 @@ public class MainActivity extends AppCompatActivity {
 
     private void updateQrUi() {
         if (btnQrMode != null) {
-            btnQrMode.setText(qrModeEnabled ? "QR:ON" : "QR:OFF");
+            btnQrMode.setText(qrModeEnabled ? "QR ON" : "QR OFF");
             btnQrMode.setBackgroundTintList(android.content.res.ColorStateList.valueOf(
                 qrModeEnabled ? COLOR_ORANGE : 0xFF333333));
         }
 
+        boolean hasValue = qrModeEnabled && !stableQrText.isEmpty();
+
         if (tvQrResult != null) {
             if (!qrModeEnabled) {
-                tvQrResult.setText("QR: off");
-            } else if (stableQrText.isEmpty()) {
-                tvQrResult.setText("QR: ready");
-            } else {
+                tvQrResult.setText("");
+            } else if (hasValue) {
                 tvQrResult.setText("QR: " + stableQrText);
+            } else {
+                tvQrResult.setText("QR scanning…");
             }
         }
 
-        boolean hasValue = qrModeEnabled && !stableQrText.isEmpty();
+        if (qrStrip != null) {
+            qrStrip.setVisibility(qrModeEnabled || hasValue ? View.VISIBLE : View.GONE);
+        }
+
         if (btnQrCopy != null) btnQrCopy.setVisibility(hasValue ? View.VISIBLE : View.GONE);
 
         boolean url = hasValue && isLikelyUrl(stableQrText);

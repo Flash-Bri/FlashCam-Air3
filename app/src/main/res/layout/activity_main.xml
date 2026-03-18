@@ -68,6 +68,7 @@
 
     <!-- QR status/action strip -->
     <LinearLayout
+        android:id="@+id/qrStrip"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_gravity="top"
@@ -202,9 +203,9 @@
 
         <Button
             android:id="@+id/btnQrMode"
-            android:layout_width="56dp"
+            android:layout_width="64dp"
             android:layout_height="40dp"
-            android:text="QR:OFF"
+            android:text="QR OFF"
             android:textColor="#FFFFFFFF"
             android:textSize="9sp"
             android:backgroundTint="#FF333333"
