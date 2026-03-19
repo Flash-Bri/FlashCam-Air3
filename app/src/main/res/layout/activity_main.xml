@@ -229,6 +229,40 @@
         </FrameLayout>
     </LinearLayout>
 
+    <!-- Zoom controls (bottom center) -->
+    <LinearLayout
+        android:id="@+id/zoomPanel"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom"
+        android:layout_marginStart="80dp"
+        android:layout_marginEnd="80dp"
+        android:layout_marginBottom="92dp"
+        android:orientation="vertical"
+        android:gravity="center"
+        android:paddingStart="12dp"
+        android:paddingEnd="12dp"
+        android:paddingTop="6dp"
+        android:paddingBottom="6dp"
+        android:background="#55000000">
+
+        <TextView
+            android:id="@+id/tvZoom"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="ZOOM 1.0x"
+            android:textColor="#FFFFFFFF"
+            android:textSize="10sp"
+            android:layout_marginBottom="4dp" />
+
+        <SeekBar
+            android:id="@+id/seekZoom"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:max="700"
+            android:progress="0" />
+    </LinearLayout>
+
     <!-- Receipt panel (bottom overlay, hidden by default) -->
     <LinearLayout
         android:id="@+id/receiptPanel"
