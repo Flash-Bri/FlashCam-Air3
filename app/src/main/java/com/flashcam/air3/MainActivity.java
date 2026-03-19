@@ -1,10 +1,12 @@
 package com.flashcam.air3;
 
 import android.Manifest;
+import android.content.ActivityNotFoundException;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.ContentValues;
 import android.content.Context;
+import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
@@ -31,6 +33,7 @@ import android.os.HandlerThread;
 import android.os.Looper;
 import android.provider.MediaStore;
 import android.util.Log;
+import android.util.Patterns;
 import android.util.Size;
 import android.view.Surface;
 import android.view.TextureView;
@@ -59,9 +62,23 @@ import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Date;
+import java.util.EnumMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.concurrent.Executor;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+import com.google.zxing.BarcodeFormat;
+import com.google.zxing.BinaryBitmap;
+import com.google.zxing.DecodeHintType;
+import com.google.zxing.LuminanceSource;
+import com.google.zxing.MultiFormatReader;
+import com.google.zxing.NotFoundException;
+import com.google.zxing.PlanarYUVLuminanceSource;
+import com.google.zxing.Result;
+import com.google.zxing.common.GlobalHistogramBinarizer;
+import com.google.zxing.common.HybridBinarizer;
 
 public class MainActivity extends AppCompatActivity {
 
@@ -86,11 +103,14 @@ public class MainActivity extends AppCompatActivity {
     private CameraDevice cameraDevice;
     private CameraCharacteristics camChars;
     private CameraCaptureSession previewSession;
+    private ImageReader qrAnalysisReader;
     private String cameraId;
     private int sensorOrientation = 0;
 
     // ── Sizes ──
     private Size previewSize;
+    private Size qrAnalysisSize;
+    private Size[] yuvOutputSizes;
     private Size[] defaultJpegSizes;
     private Size[] maxResJpegSizes;
     private Size[] maxResRawSizes;
@@ -107,12 +127,14 @@ public class MainActivity extends AppCompatActivity {
     private TextureView textureView;
     private View shutterFlashOverlay;
     private View focusRing;
+    private View qrStrip;
     private TextView tvStatus, tvMode, tvFocusIndicator, tvEv;
-    private TextView tvReceipt;
+    private TextView tvReceipt, tvQrResult;
     private ImageButton btnShutter;
     private Button btnMode, btnDng, btnDebug, btnCredits;
     private Button btnEvPlus, btnEvMinus;
     private Button btnCopyReceipt, btnExportLog, btnDismiss;
+    private Button btnQrMode, btnQrOpen, btnQrCopy;
     private LinearLayout receiptPanel;
 
     // ── State machine ──
@@ -123,6 +145,25 @@ public class MainActivity extends AppCompatActivity {
     // ── Receipt log ──
     private String lastReceipt = "";
     private final List<String> receiptLog = new ArrayList<>();
+
+    // ── Minimal QR slice state ──
+    private final MultiFormatReader qrReader = new MultiFormatReader();
+    private final AtomicBoolean qrDecodeInFlight = new AtomicBoolean(false);
+    private long lastQrDecodeAtMs = 0;
+    private boolean qrModeEnabled = false;
+    private String qrCandidateText = "";
+    private int qrCandidateHits = 0;
+    private int qrMissCount = 0;
+    private String stableQrText = "";
+    private int qrRegionCursor = 0;
+    private static final long QR_DECODE_THROTTLE_MS = 200;
+    private static final int QR_STABLE_HITS_REQUIRED = 2;
+    private static final int QR_CLEAR_MISS_COUNT = 12;
+
+    // ── Focus/metering hold state ──
+    private MeteringRectangle[] activeFocusRegions = null;
+    private long focusRegionHoldUntilMs = 0;
+    private static final long FOCUS_REGION_HOLD_MS = 3500;
 
     // ================================================================
     // LIFECYCLE
@@ -135,6 +176,7 @@ public class MainActivity extends AppCompatActivity {
 
         bindViews();
         setupListeners();
+        updateQrUi();
 
         camThread = new HandlerThread("CamThread");
         camThread.start();
@@ -145,6 +187,11 @@ public class MainActivity extends AppCompatActivity {
         workerHandler = new Handler(workerThread.getLooper());
 
         camManager = (CameraManager) getSystemService(Context.CAMERA_SERVICE);
+
+        Map<DecodeHintType, Object> hints = new EnumMap<>(DecodeHintType.class);
+        hints.put(DecodeHintType.POSSIBLE_FORMATS, Arrays.asList(BarcodeFormat.QR_CODE));
+        hints.put(DecodeHintType.TRY_HARDER, Boolean.TRUE);
+        qrReader.setHints(hints);
 
         checkPermissions();
     }
@@ -177,11 +224,13 @@ public class MainActivity extends AppCompatActivity {
         textureView = findViewById(R.id.textureView);
         shutterFlashOverlay = findViewById(R.id.shutterFlashOverlay);
         focusRing = findViewById(R.id.focusRing);
+        qrStrip = findViewById(R.id.qrStrip);
         tvStatus = findViewById(R.id.tvStatus);
         tvMode = findViewById(R.id.tvMode);
         tvFocusIndicator = findViewById(R.id.tvFocusIndicator);
         tvEv = findViewById(R.id.tvEv);
         tvReceipt = findViewById(R.id.tvReceipt);
+        tvQrResult = findViewById(R.id.tvQrResult);
         btnShutter = findViewById(R.id.btnShutter);
         btnMode = findViewById(R.id.btnMode);
         btnDng = findViewById(R.id.btnDng);
@@ -192,6 +241,9 @@ public class MainActivity extends AppCompatActivity {
         btnCopyReceipt = findViewById(R.id.btnCopyReceipt);
         btnExportLog = findViewById(R.id.btnExportLog);
         btnDismiss = findViewById(R.id.btnDismiss);
+        btnQrMode = findViewById(R.id.btnQrMode);
+        btnQrOpen = findViewById(R.id.btnQrOpen);
+        btnQrCopy = findViewById(R.id.btnQrCopy);
         receiptPanel = findViewById(R.id.receiptPanel);
     }
 
@@ -244,6 +296,10 @@ public class MainActivity extends AppCompatActivity {
 
         btnEvPlus.setOnClickListener(v -> adjustEv(1));
         btnEvMinus.setOnClickListener(v -> adjustEv(-1));
+
+        btnQrMode.setOnClickListener(v -> setQrModeEnabled(!qrModeEnabled));
+        btnQrOpen.setOnClickListener(v -> openQrValue());
+        btnQrCopy.setOnClickListener(v -> copyQrValue());
 
         btnDebug.setOnClickListener(v -> {
             debugEnabled = !debugEnabled;
@@ -336,7 +392,11 @@ public class MainActivity extends AppCompatActivity {
             if (defaultMap != null) {
                 defaultJpegSizes = defaultMap.getOutputSizes(ImageFormat.JPEG);
                 previewSize = findBest43Preview(defaultMap.getOutputSizes(SurfaceTexture.class));
+                yuvOutputSizes = defaultMap.getOutputSizes(ImageFormat.YUV_420_888);
+                qrAnalysisSize = findBestQrAnalysisSize(yuvOutputSizes, previewSize);
             }
+
+            logCameraDiagnostics();
 
             // Max-res stream map (API 31+)
             try {
@@ -424,7 +484,9 @@ public class MainActivity extends AppCompatActivity {
     private void closeCamera() {
         try {
             if (previewSession != null) { previewSession.close(); previewSession = null; }
+            if (qrAnalysisReader != null) { qrAnalysisReader.close(); qrAnalysisReader = null; }
             if (cameraDevice != null) { cameraDevice.close(); cameraDevice = null; }
+            qrDecodeInFlight.set(false);
         } catch (Exception ignored) {}
     }
 
@@ -442,16 +504,17 @@ public class MainActivity extends AppCompatActivity {
             st.setDefaultBufferSize(ps.getWidth(), ps.getHeight());
             Surface previewSurface = new Surface(st);
 
-            CaptureRequest.Builder previewBuilder =
-                cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
-            previewBuilder.addTarget(previewSurface);
-            previewBuilder.set(CaptureRequest.CONTROL_AF_MODE,
-                CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE);
-            previewBuilder.set(CaptureRequest.CONTROL_AE_MODE,
-                CaptureRequest.CONTROL_AE_MODE_ON);
-            previewBuilder.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, currentEv);
+            Size analysisSize = qrAnalysisSize != null ? qrAnalysisSize : ps;
+            if (qrAnalysisReader != null) { qrAnalysisReader.close(); qrAnalysisReader = null; }
+            qrAnalysisReader = ImageReader.newInstance(
+                analysisSize.getWidth(), analysisSize.getHeight(), ImageFormat.YUV_420_888, 2);
+            qrAnalysisReader.setOnImageAvailableListener(this::onQrFrameAvailable, camHandler);
 
-            List<OutputConfiguration> outputs = Arrays.asList(new OutputConfiguration(previewSurface));
+            CaptureRequest.Builder previewBuilder = buildPreviewRequestBuilder(previewSurface, null, false);
+
+            List<OutputConfiguration> outputs = Arrays.asList(
+                new OutputConfiguration(previewSurface),
+                new OutputConfiguration(qrAnalysisReader.getSurface()));
             Executor prevExec = camHandler::post;
 
             final Object sessLock = new Object();
@@ -492,11 +555,425 @@ public class MainActivity extends AppCompatActivity {
                 btnShutter.setEnabled(true);
                 configurePreviewTransform(textureView.getWidth(), textureView.getHeight());
                 updateModeDisplay();
+                updateQrUi();
             });
 
         } catch (Exception e) {
             setStatusForced("Preview error: " + e.getMessage());
             transitionState(CamState.ERROR);
+        }
+    }
+
+    // ================================================================
+    // QR PREVIEW ANALYSIS (MINIMAL SLICE)
+    // ================================================================
+    private void onQrFrameAvailable(ImageReader reader) {
+        Image image = reader.acquireLatestImage();
+        if (image == null) return;
+
+        long now = System.currentTimeMillis();
+        if (!qrModeEnabled || capturing || now - lastQrDecodeAtMs < QR_DECODE_THROTTLE_MS
+            || !qrDecodeInFlight.compareAndSet(false, true)) {
+            image.close();
+            return;
+        }
+        lastQrDecodeAtMs = now;
+
+        final int width = image.getWidth();
+        final int height = image.getHeight();
+        final byte[] yData = copyYPlane(image);
+        image.close();
+
+        workerHandler.post(() -> {
+            try {
+                String decoded = tryDecodeQr(yData, width, height);
+                handleQrDecodeResult(decoded);
+            } catch (Exception ignored) {
+            } finally {
+                qrDecodeInFlight.set(false);
+            }
+        });
+    }
+
+    private String tryDecodeQr(byte[] yData, int width, int height) {
+        // Pass 1: full frame catches obvious/large targets anywhere.
+        String full = decodeQrRegion(yData, width, height, 0, 0, width, height);
+        if (full != null && !full.isEmpty()) return full;
+
+        // Pass 2: centered mid crop boosts module size for medium/small center targets.
+        String center = decodeQrRegion(yData, width, height,
+            width / 6, height / 6, (width * 2) / 3, (height * 2) / 3);
+        if (center != null && !center.isEmpty()) return center;
+
+        // Pass 3+: rotating regional coverage so smaller clear QR can be found away from center.
+        // Large window (coverage) then tighter window (effective digital zoom) at same anchor.
+        int[][] anchors = buildGridAnchors(width, height, 3, 3);
+        if (anchors.length == 0) return null;
+
+        int idx = qrRegionCursor % anchors.length;
+        qrRegionCursor = (qrRegionCursor + 1) % anchors.length;
+
+        int ax = anchors[idx][0];
+        int ay = anchors[idx][1];
+
+        int largeW = (width * 3) / 5;
+        int largeH = (height * 3) / 5;
+        String regional = decodeQrRegion(yData, width, height, ax, ay, largeW, largeH);
+        if (regional != null && !regional.isEmpty()) return regional;
+
+        int tightW = width / 2;
+        int tightH = height / 2;
+        String tight = decodeQrRegion(yData, width, height, ax, ay, tightW, tightH);
+        if (tight != null && !tight.isEmpty()) return tight;
+
+        return null;
+    }
+
+    private int[][] buildGridAnchors(int width, int height, int cols, int rows) {
+        int[][] out = new int[cols * rows][2];
+        int i = 0;
+
+        int maxLeftLarge = Math.max(0, width - (width * 3) / 5);
+        int maxTopLarge = Math.max(0, height - (height * 3) / 5);
+
+        for (int r = 0; r < rows; r++) {
+            float ry = rows == 1 ? 0f : (float) r / (rows - 1);
+            int top = (int) (ry * maxTopLarge);
+            for (int c = 0; c < cols; c++) {
+                float cx = cols == 1 ? 0f : (float) c / (cols - 1);
+                int left = (int) (cx * maxLeftLarge);
+                out[i][0] = left;
+                out[i][1] = top;
+                i++;
+            }
+        }
+
+        return out;
+    }
+
+    private String decodeQrRegion(byte[] yData, int width, int height,
+                                  int left, int top, int regionWidth, int regionHeight) {
+        if (regionWidth <= 0 || regionHeight <= 0) return null;
+        if (left < 0) left = 0;
+        if (top < 0) top = 0;
+        if (left + regionWidth > width) left = Math.max(0, width - regionWidth);
+        if (top + regionHeight > height) top = Math.max(0, height - regionHeight);
+        LuminanceSource src = new PlanarYUVLuminanceSource(
+            yData, width, height, left, top, regionWidth, regionHeight, false);
+
+        String hybrid = decodeBitmap(new BinaryBitmap(new HybridBinarizer(src)),
+            "hybrid", left, top, regionWidth, regionHeight, width, height);
+        if (hybrid != null) return hybrid;
+
+        String global = decodeBitmap(new BinaryBitmap(new GlobalHistogramBinarizer(src)),
+            "global", left, top, regionWidth, regionHeight, width, height);
+        if (global != null) return global;
+
+        return null;
+    }
+
+    private String decodeBitmap(BinaryBitmap bmp,
+                                String mode,
+                                int regionLeft,
+                                int regionTop,
+                                int regionWidth,
+                                int regionHeight,
+                                int frameWidth,
+                                int frameHeight) {
+        try {
+            Result r = qrReader.decodeWithState(bmp);
+            qrReader.reset();
+            if (r != null) {
+                logDecodeSuccess(r, mode, regionLeft, regionTop, regionWidth, regionHeight, frameWidth, frameHeight);
+                return r.getText();
+            }
+            return null;
+        } catch (NotFoundException nf) {
+            qrReader.reset();
+            return null;
+        } catch (Exception e) {
+            qrReader.reset();
+            return null;
+        }
+    }
+
+    private void logDecodeSuccess(Result result,
+                                  String mode,
+                                  int regionLeft,
+                                  int regionTop,
+                                  int regionWidth,
+                                  int regionHeight,
+                                  int frameWidth,
+                                  int frameHeight) {
+        try {
+            com.google.zxing.ResultPoint[] pts = result.getResultPoints();
+            float minX = Float.MAX_VALUE, minY = Float.MAX_VALUE;
+            float maxX = Float.MIN_VALUE, maxY = Float.MIN_VALUE;
+            if (pts != null) {
+                for (com.google.zxing.ResultPoint p : pts) {
+                    if (p == null) continue;
+                    float x = p.getX() + regionLeft;
+                    float y = p.getY() + regionTop;
+                    minX = Math.min(minX, x);
+                    maxX = Math.max(maxX, x);
+                    minY = Math.min(minY, y);
+                    maxY = Math.max(maxY, y);
+                }
+            }
+            float spanW = (maxX > minX) ? (maxX - minX) : -1f;
+            float spanH = (maxY > minY) ? (maxY - minY) : -1f;
+            float pctW = spanW > 0 ? (100f * spanW / frameWidth) : -1f;
+            float pctH = spanH > 0 ? (100f * spanH / frameHeight) : -1f;
+            Log.i(TAG, String.format(Locale.US,
+                "QR decode success mode=%s frame=%dx%d region=%d,%d %dx%d qrSpan=%.1fx%.1fpx (%.1f%% x %.1f%%)",
+                mode, frameWidth, frameHeight, regionLeft, regionTop, regionWidth, regionHeight,
+                spanW, spanH, pctW, pctH));
+        } catch (Exception ignored) {}
+    }
+
+    private byte[] copyYPlane(Image image) {
+        Image.Plane plane = image.getPlanes()[0];
+        ByteBuffer buffer = plane.getBuffer();
+        int width = image.getWidth();
+        int height = image.getHeight();
+        int rowStride = plane.getRowStride();
+        int pixelStride = plane.getPixelStride();
+
+        byte[] out = new byte[width * height];
+        byte[] row = new byte[rowStride];
+        int outOffset = 0;
+
+        for (int y = 0; y < height; y++) {
+            int rowLen = Math.min(rowStride, buffer.remaining());
+            if (rowLen <= 0) break;
+            buffer.get(row, 0, rowLen);
+
+            if (pixelStride == 1) {
+                System.arraycopy(row, 0, out, outOffset, Math.min(width, rowLen));
+            } else {
+                for (int x = 0; x < width; x++) {
+                    int src = x * pixelStride;
+                    if (src < rowLen) {
+                        out[outOffset + x] = row[src];
+                    }
+                }
+            }
+            outOffset += width;
+        }
+        return out;
+    }
+
+    private void handleQrDecodeResult(String decoded) {
+        if (!qrModeEnabled) return;
+
+        if (decoded == null || decoded.isEmpty()) {
+            qrMissCount++;
+            if (qrMissCount >= QR_CLEAR_MISS_COUNT && !stableQrText.isEmpty()) {
+                stableQrText = "";
+                qrCandidateText = "";
+                qrCandidateHits = 0;
+                mainHandler.post(this::updateQrUi);
+            }
+            return;
+        }
+
+        qrMissCount = 0;
+        if (decoded.equals(qrCandidateText)) {
+            qrCandidateHits++;
+        } else {
+            qrCandidateText = decoded;
+            qrCandidateHits = 1;
+        }
+
+        if (qrCandidateHits >= QR_STABLE_HITS_REQUIRED && !decoded.equals(stableQrText)) {
+            stableQrText = decoded;
+            mainHandler.post(this::updateQrUi);
+        }
+    }
+
+    private void setQrModeEnabled(boolean enabled) {
+        qrModeEnabled = enabled;
+        qrCandidateText = "";
+        qrCandidateHits = 0;
+        qrMissCount = 0;
+        qrRegionCursor = 0;
+        stableQrText = "";
+        if (!enabled) {
+            activeFocusRegions = null;
+            focusRegionHoldUntilMs = 0;
+        }
+        updateQrUi();
+        applyPreviewRepeatingRequest();
+    }
+
+    private void updateQrUi() {
+        if (btnQrMode != null) {
+            btnQrMode.setText(qrModeEnabled ? "QR ON" : "QR OFF");
+            btnQrMode.setBackgroundTintList(android.content.res.ColorStateList.valueOf(
+                qrModeEnabled ? COLOR_ORANGE : 0xFF333333));
+        }
+
+        boolean hasValue = qrModeEnabled && !stableQrText.isEmpty();
+
+        if (tvQrResult != null) {
+            if (!qrModeEnabled) {
+                tvQrResult.setText("");
+            } else if (hasValue) {
+                tvQrResult.setText("QR: " + stableQrText);
+            } else {
+                tvQrResult.setText("QR scanning…");
+            }
+        }
+
+        if (qrStrip != null) {
+            qrStrip.setVisibility(qrModeEnabled || hasValue ? View.VISIBLE : View.GONE);
+        }
+
+        if (btnQrCopy != null) btnQrCopy.setVisibility(hasValue ? View.VISIBLE : View.GONE);
+
+        boolean url = hasValue && isLikelyUrl(stableQrText);
+        if (btnQrOpen != null) btnQrOpen.setVisibility(url ? View.VISIBLE : View.GONE);
+    }
+
+    private boolean isLikelyUrl(String value) {
+        return value != null
+            && (value.startsWith("http://") || value.startsWith("https://"))
+            && Patterns.WEB_URL.matcher(value).matches();
+    }
+
+    private void openQrValue() {
+        if (!isLikelyUrl(stableQrText)) return;
+        try {
+            Intent i = new Intent(Intent.ACTION_VIEW, Uri.parse(stableQrText));
+            startActivity(i);
+        } catch (ActivityNotFoundException e) {
+            Toast.makeText(this, "No app can open this link", Toast.LENGTH_SHORT).show();
+        } catch (Exception e) {
+            Toast.makeText(this, "Open failed", Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    private void copyQrValue() {
+        if (stableQrText == null || stableQrText.isEmpty()) return;
+        ClipboardManager cb = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+        if (cb != null) {
+            cb.setPrimaryClip(ClipData.newPlainText("FlashCam QR", stableQrText));
+            Toast.makeText(this, "QR copied", Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    private CaptureRequest.Builder buildPreviewRequestBuilder(Surface previewSurface,
+                                                              Integer afTrigger,
+                                                              boolean preferTapFocus) throws CameraAccessException {
+        CaptureRequest.Builder b = cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
+        b.addTarget(previewSurface);
+        if (qrAnalysisReader != null) b.addTarget(qrAnalysisReader.getSurface());
+
+        long now = System.currentTimeMillis();
+        boolean holdFocusRegion = activeFocusRegions != null && now < focusRegionHoldUntilMs;
+        boolean useTapFocus = preferTapFocus || holdFocusRegion;
+
+        b.set(CaptureRequest.CONTROL_AF_MODE,
+            useTapFocus ? CaptureRequest.CONTROL_AF_MODE_AUTO
+                        : CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE);
+        b.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON);
+        b.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, currentEv);
+
+        if (holdFocusRegion) {
+            Integer maxAfRegions = camChars != null ? camChars.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AF) : 0;
+            Integer maxAeRegions = camChars != null ? camChars.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AE) : 0;
+            if (maxAfRegions != null && maxAfRegions > 0) {
+                b.set(CaptureRequest.CONTROL_AF_REGIONS, activeFocusRegions);
+            }
+            if (maxAeRegions != null && maxAeRegions > 0) {
+                b.set(CaptureRequest.CONTROL_AE_REGIONS, activeFocusRegions);
+            }
+        }
+
+        if (afTrigger != null) {
+            b.set(CaptureRequest.CONTROL_AF_TRIGGER, afTrigger);
+        }
+
+        return b;
+    }
+
+    private void applyPreviewRepeatingRequest() {
+        if (previewSession == null || cameraDevice == null) return;
+        try {
+            SurfaceTexture st = textureView.getSurfaceTexture();
+            if (st == null) return;
+            Size ps = previewSize != null ? previewSize : new Size(1440, 1080);
+            st.setDefaultBufferSize(ps.getWidth(), ps.getHeight());
+            Surface previewSurface = new Surface(st);
+            CaptureRequest.Builder b = buildPreviewRequestBuilder(previewSurface, null, false);
+            previewSession.setRepeatingRequest(b.build(), new CameraCaptureSession.CaptureCallback() {
+                @Override public void onCaptureCompleted(@NonNull CameraCaptureSession s,
+                        @NonNull CaptureRequest r, @NonNull TotalCaptureResult result) {
+                    updateFocusIndicator(result);
+                }
+            }, camHandler);
+        } catch (Exception e) {
+            Log.w(TAG, "applyPreviewRepeatingRequest error: " + e.getMessage());
+        }
+    }
+
+    private MeteringRectangle[] mapTapToMeteringRegions(float tx, float ty) {
+        int vw = textureView.getWidth();
+        int vh = textureView.getHeight();
+        if (vw == 0 || vh == 0 || previewSize == null || camChars == null) return null;
+
+        float pw = previewSize.getWidth();
+        float ph = previewSize.getHeight();
+        float fitScale = Math.min((float) vw / pw, (float) vh / ph);
+        float contentW = pw * fitScale;
+        float contentH = ph * fitScale;
+        float leftPad = (vw - contentW) / 2f;
+        float topPad = (vh - contentH) / 2f;
+
+        float cx = Math.max(leftPad, Math.min(leftPad + contentW, tx));
+        float cy = Math.max(topPad, Math.min(topPad + contentH, ty));
+
+        float nx = (cx - leftPad) / contentW;
+        float ny = (cy - topPad) / contentH;
+
+        android.graphics.Rect activeArray = camChars.get(
+            CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE);
+        if (activeArray == null) return null;
+
+        int aw = activeArray.width();
+        int ah = activeArray.height();
+        int regionSize = (int) (Math.max(aw, ah) * 0.12f);
+        int sensorX = activeArray.left + (int) (nx * aw);
+        int sensorY = activeArray.top + (int) (ny * ah);
+
+        int l = Math.max(activeArray.left, sensorX - regionSize / 2);
+        int t = Math.max(activeArray.top, sensorY - regionSize / 2);
+        int r = Math.min(activeArray.right, l + regionSize);
+        int b = Math.min(activeArray.bottom, t + regionSize);
+
+        return new MeteringRectangle[]{
+            new MeteringRectangle(l, t, r - l, b - t, 1000)
+        };
+    }
+
+    private void logCameraDiagnostics() {
+        if (camChars == null) return;
+        try {
+            int[] afModes = camChars.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES);
+            Integer maxAfRegions = camChars.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AF);
+            Integer maxAeRegions = camChars.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AE);
+            Float minFocusDistance = camChars.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE);
+            android.graphics.Rect activeArray = camChars.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE);
+            Log.i(TAG, "Camera diag: preview=" + fmtSize(previewSize)
+                + " analysis=" + fmtSize(qrAnalysisSize)
+                + " sensorActive=" + (activeArray != null ? activeArray.toShortString() : "?")
+                + " yuvSizes=" + fmtSizeList(yuvOutputSizes)
+                + " afModes=" + Arrays.toString(afModes)
+                + " maxAFRegions=" + maxAfRegions
+                + " maxAERegions=" + maxAeRegions
+                + " minFocusDistance=" + minFocusDistance);
+        } catch (Exception e) {
+            Log.w(TAG, "logCameraDiagnostics error: " + e.getMessage());
         }
     }
 
@@ -585,49 +1062,33 @@ public class MainActivity extends AppCompatActivity {
                 focusRing.setVisibility(View.GONE)).start();
         });
 
-        // Map tap to sensor coordinates [0..1]
-        int vw = textureView.getWidth();
-        int vh = textureView.getHeight();
-        if (vw == 0 || vh == 0) return;
-
-        float nx = tx / vw;
-        float ny = ty / vh;
-
-        // Map to sensor active array
-        android.graphics.Rect activeArray = camChars.get(
-            CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE);
-        if (activeArray == null) return;
-
-        int aw = activeArray.width();
-        int ah = activeArray.height();
-        int regionSize = (int) (Math.max(aw, ah) * 0.1f);
-        int cx = (int) (nx * aw);
-        int cy = (int) (ny * ah);
-
-        int left = Math.max(0, cx - regionSize / 2);
-        int top = Math.max(0, cy - regionSize / 2);
-        int right = Math.min(aw, left + regionSize);
-        int bottom = Math.min(ah, top + regionSize);
-
-        MeteringRectangle[] regions = new MeteringRectangle[]{
-            new MeteringRectangle(left, top, right - left, bottom - top, 1000)
-        };
+        MeteringRectangle[] regions = mapTapToMeteringRegions(tx, ty);
+        if (regions == null) return;
 
         try {
-            CaptureRequest.Builder afBuilder =
-                cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
             SurfaceTexture st = textureView.getSurfaceTexture();
             if (st == null) return;
             Size ps = previewSize != null ? previewSize : new Size(1440, 1080);
             st.setDefaultBufferSize(ps.getWidth(), ps.getHeight());
-            afBuilder.addTarget(new Surface(st));
-            afBuilder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO);
-            afBuilder.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_START);
-            afBuilder.set(CaptureRequest.CONTROL_AF_REGIONS, regions);
-            afBuilder.set(CaptureRequest.CONTROL_AE_REGIONS, regions);
-            afBuilder.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, currentEv);
+            Surface previewSurface = new Surface(st);
 
-            previewSession.capture(afBuilder.build(), null, camHandler);
+            activeFocusRegions = regions;
+            focusRegionHoldUntilMs = System.currentTimeMillis() + FOCUS_REGION_HOLD_MS;
+
+            CaptureRequest.Builder triggerBuilder = buildPreviewRequestBuilder(
+                previewSurface, CaptureRequest.CONTROL_AF_TRIGGER_START, true);
+            previewSession.capture(triggerBuilder.build(), null, camHandler);
+
+            CaptureRequest.Builder holdBuilder = buildPreviewRequestBuilder(
+                previewSurface, CaptureRequest.CONTROL_AF_TRIGGER_IDLE, true);
+            previewSession.setRepeatingRequest(holdBuilder.build(), null, camHandler);
+
+            mainHandler.postDelayed(() -> {
+                if (System.currentTimeMillis() >= focusRegionHoldUntilMs) {
+                    activeFocusRegions = null;
+                    applyPreviewRepeatingRequest();
+                }
+            }, FOCUS_REGION_HOLD_MS + 100);
         } catch (Exception e) {
             Log.w(TAG, "Tap-to-focus error: " + e.getMessage());
         }
@@ -670,6 +1131,10 @@ public class MainActivity extends AppCompatActivity {
                 previewSession.close();
                 previewSession = null;
                 Thread.sleep(200);
+            }
+            if (qrAnalysisReader != null) {
+                qrAnalysisReader.close();
+                qrAnalysisReader = null;
             }
 
             // Determine capture size
@@ -1137,21 +1602,7 @@ public class MainActivity extends AppCompatActivity {
 
         // Apply to current preview
         if (previewSession != null && cameraDevice != null && !capturing) {
-            try {
-                CaptureRequest.Builder b = cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
-                SurfaceTexture st = textureView.getSurfaceTexture();
-                if (st != null) {
-                    Size ps = previewSize != null ? previewSize : new Size(1440, 1080);
-                    st.setDefaultBufferSize(ps.getWidth(), ps.getHeight());
-                    b.addTarget(new Surface(st));
-                    b.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE);
-                    b.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON);
-                    b.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, currentEv);
-                    previewSession.setRepeatingRequest(b.build(), null, camHandler);
-                }
-            } catch (Exception e) {
-                Log.w(TAG, "EV adjust error: " + e.getMessage());
-            }
+            applyPreviewRepeatingRequest();
         }
     }
 
@@ -1269,6 +1720,39 @@ public class MainActivity extends AppCompatActivity {
     // ================================================================
     private String fmtSize(Size s) {
         return s != null ? s.getWidth() + "x" + s.getHeight() : "?";
+    }
+
+    private String fmtSizeList(Size[] sizes) {
+        if (sizes == null || sizes.length == 0) return "[]";
+        StringBuilder sb = new StringBuilder("[");
+        int shown = Math.min(sizes.length, 12);
+        for (int i = 0; i < shown; i++) {
+            if (i > 0) sb.append(",");
+            sb.append(fmtSize(sizes[i]));
+        }
+        if (sizes.length > shown) sb.append(",...");
+        sb.append("]");
+        return sb.toString();
+    }
+
+    private Size findBestQrAnalysisSize(Size[] yuvSizes, Size fallback) {
+        if (yuvSizes == null || yuvSizes.length == 0) return fallback;
+
+        // Prefer higher-detail 4:3 YUV (up to 1920x1440) for QR decode while keeping cost bounded.
+        Size best43 = null;
+        long best43Px = 0;
+        Size bestAny = null;
+        long bestAnyPx = 0;
+        for (Size s : yuvSizes) {
+            int w = s.getWidth(), h = s.getHeight();
+            long px = (long) w * h;
+            if (px > 1920L * 1440) continue;
+            float ratio = (float) w / h;
+            boolean is43 = Math.abs(ratio - 4f / 3f) < 0.02f;
+            if (is43 && px > best43Px) { best43 = s; best43Px = px; }
+            if (px > bestAnyPx) { bestAny = s; bestAnyPx = px; }
+        }
+        return best43 != null ? best43 : (bestAny != null ? bestAny : fallback);
     }
 
     private Size findLargest(Size[] sizes) {

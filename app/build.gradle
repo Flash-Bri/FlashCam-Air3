@@ -54,4 +54,6 @@ dependencies {
     implementation 'androidx.appcompat:appcompat:1.6.1'
     implementation 'com.google.android.material:material:1.11.0'
     implementation 'androidx.core:core:1.12.0'
+    // Minimal QR decode dependency (core only), keeps first slice narrow.
+    implementation 'com.google.zxing:core:3.5.3'
 }
