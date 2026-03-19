@@ -162,6 +162,7 @@ public class MainActivity extends AppCompatActivity {
     private static final long QR_DECODE_THROTTLE_MS = 200;
     private static final int QR_STABLE_HITS_REQUIRED = 2;
     private static final int QR_CLEAR_MISS_COUNT = 12;
+    private static final int QR_HINT_MISS_THRESHOLD = 5;
 
     // ── Focus/metering hold state ──
     private MeteringRectangle[] activeFocusRegions = null;
@@ -347,6 +348,7 @@ public class MainActivity extends AppCompatActivity {
                     if (!fromUser || !zoomSupported) return;
                     currentZoomRatio = progressToZoomRatio(progress);
                     updateZoomUi();
+                    updateQrUi();
                     requestZoomApply(false);
                 }
 
@@ -841,6 +843,14 @@ public class MainActivity extends AppCompatActivity {
         applyPreviewRepeatingRequest();
     }
 
+    private String getQrZoomAssistHint() {
+        if (!qrModeEnabled || !zoomSupported) return "";
+        if (currentZoomRatio > 4.2f) return "Hint: reduce to 2x–4x for cleaner QR detail";
+        if (currentZoomRatio < 1.8f && qrMissCount >= QR_HINT_MISS_THRESHOLD) return "Hint: try 2x–4x for small/far QR";
+        if (qrMissCount >= QR_HINT_MISS_THRESHOLD) return "Hint: hold steady, increase light, keep QR centered";
+        return "";
+    }
+
     private void updateQrUi() {
         if (btnQrMode != null) {
             btnQrMode.setText(qrModeEnabled ? "QR ON" : "QR OFF");
@@ -856,7 +866,8 @@ public class MainActivity extends AppCompatActivity {
             } else if (hasValue) {
                 tvQrResult.setText("QR: " + stableQrText);
             } else {
-                tvQrResult.setText("QR scanning…");
+                String hint = getQrZoomAssistHint();
+                tvQrResult.setText(hint.isEmpty() ? "QR scanning…" : "QR scanning…  " + hint);
             }
         }
 
