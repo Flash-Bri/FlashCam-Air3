@@ -34,6 +34,7 @@ import android.os.Looper;
 import android.provider.MediaStore;
 import android.util.Log;
 import android.util.Patterns;
+import android.util.Range;
 import android.util.Size;
 import android.view.Surface;
 import android.view.TextureView;
@@ -42,6 +43,7 @@ import android.widget.Button;
 import android.widget.FrameLayout;
 import android.widget.ImageButton;
 import android.widget.LinearLayout;
+import android.widget.SeekBar;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -129,7 +131,8 @@ public class MainActivity extends AppCompatActivity {
     private View focusRing;
     private View qrStrip;
     private TextView tvStatus, tvMode, tvFocusIndicator, tvEv;
-    private TextView tvReceipt, tvQrResult;
+    private TextView tvReceipt, tvQrResult, tvZoom;
+    private SeekBar seekZoom;
     private ImageButton btnShutter;
     private Button btnMode, btnDng, btnDebug, btnCredits;
     private Button btnEvPlus, btnEvMinus;
@@ -159,11 +162,23 @@ public class MainActivity extends AppCompatActivity {
     private static final long QR_DECODE_THROTTLE_MS = 200;
     private static final int QR_STABLE_HITS_REQUIRED = 2;
     private static final int QR_CLEAR_MISS_COUNT = 12;
+    private static final int QR_HINT_MISS_THRESHOLD = 5;
 
     // ── Focus/metering hold state ──
     private MeteringRectangle[] activeFocusRegions = null;
     private long focusRegionHoldUntilMs = 0;
     private static final long FOCUS_REGION_HOLD_MS = 3500;
+
+    // ── Zoom state ──
+    private Range<Float> zoomRatioRange = null;
+    private boolean zoomSupported = false;
+    private float zoomMinRatio = 1.0f;
+    private float zoomMaxRatio = 1.0f;
+    private float currentZoomRatio = 1.0f;
+    private static final float UI_MAX_ZOOM_RATIO = 8.0f;
+    private static final int ZOOM_SEEKBAR_MAX = 700; // 1.0x .. 8.0x in 0.01-ish steps
+    private long lastZoomApplyMs = 0L;
+    private static final long ZOOM_APPLY_MIN_INTERVAL_MS = 33L;
 
     // ================================================================
     // LIFECYCLE
@@ -231,6 +246,8 @@ public class MainActivity extends AppCompatActivity {
         tvEv = findViewById(R.id.tvEv);
         tvReceipt = findViewById(R.id.tvReceipt);
         tvQrResult = findViewById(R.id.tvQrResult);
+        tvZoom = findViewById(R.id.tvZoom);
+        seekZoom = findViewById(R.id.seekZoom);
         btnShutter = findViewById(R.id.btnShutter);
         btnMode = findViewById(R.id.btnMode);
         btnDng = findViewById(R.id.btnDng);
@@ -324,6 +341,24 @@ public class MainActivity extends AppCompatActivity {
         btnCopyReceipt.setOnClickListener(v -> copyReceipt());
         btnExportLog.setOnClickListener(v -> exportLog());
         btnDismiss.setOnClickListener(v -> receiptPanel.setVisibility(View.GONE));
+
+        if (seekZoom != null) {
+            seekZoom.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+                @Override public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
+                    if (!fromUser || !zoomSupported) return;
+                    currentZoomRatio = progressToZoomRatio(progress);
+                    updateZoomUi();
+                    updateQrUi();
+                    requestZoomApply(false);
+                }
+
+                @Override public void onStartTrackingTouch(SeekBar seekBar) { }
+
+                @Override public void onStopTrackingTouch(SeekBar seekBar) {
+                    requestZoomApply(true);
+                }
+            });
+        }
     }
 
     // ================================================================
@@ -385,6 +420,7 @@ public class MainActivity extends AppCompatActivity {
 
             Integer so = camChars.get(CameraCharacteristics.SENSOR_ORIENTATION);
             sensorOrientation = (so != null) ? so : 0;
+            initZoomCapabilities();
 
             // Default stream map
             StreamConfigurationMap defaultMap = camChars.get(
@@ -556,6 +592,7 @@ public class MainActivity extends AppCompatActivity {
                 configurePreviewTransform(textureView.getWidth(), textureView.getHeight());
                 updateModeDisplay();
                 updateQrUi();
+                updateZoomUi();
             });
 
         } catch (Exception e) {
@@ -806,6 +843,14 @@ public class MainActivity extends AppCompatActivity {
         applyPreviewRepeatingRequest();
     }
 
+    private String getQrZoomAssistHint() {
+        if (!qrModeEnabled || !zoomSupported) return "";
+        if (currentZoomRatio > 4.2f) return "Hint: reduce to 2x–4x for cleaner QR detail";
+        if (currentZoomRatio < 1.8f && qrMissCount >= QR_HINT_MISS_THRESHOLD) return "Hint: try 2x–4x for small/far QR";
+        if (qrMissCount >= QR_HINT_MISS_THRESHOLD) return "Hint: hold steady, increase light, keep QR centered";
+        return "";
+    }
+
     private void updateQrUi() {
         if (btnQrMode != null) {
             btnQrMode.setText(qrModeEnabled ? "QR ON" : "QR OFF");
@@ -821,7 +866,8 @@ public class MainActivity extends AppCompatActivity {
             } else if (hasValue) {
                 tvQrResult.setText("QR: " + stableQrText);
             } else {
-                tvQrResult.setText("QR scanning…");
+                String hint = getQrZoomAssistHint();
+                tvQrResult.setText(hint.isEmpty() ? "QR scanning…" : "QR scanning…  " + hint);
             }
         }
 
@@ -862,6 +908,88 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
+    private void initZoomCapabilities() {
+        zoomSupported = false;
+        zoomRatioRange = null;
+        zoomMinRatio = 1.0f;
+        zoomMaxRatio = 1.0f;
+        currentZoomRatio = 1.0f;
+
+        if (camChars == null) {
+            updateZoomUi();
+            return;
+        }
+
+        try {
+            Range<Float> range = camChars.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE);
+            if (range != null && range.getUpper() != null && range.getUpper() > 1.0f) {
+                zoomRatioRange = range;
+                zoomSupported = true;
+                zoomMinRatio = Math.max(1.0f, range.getLower());
+                zoomMaxRatio = Math.min(UI_MAX_ZOOM_RATIO, range.getUpper());
+                if (zoomMaxRatio < zoomMinRatio) zoomMaxRatio = zoomMinRatio;
+                currentZoomRatio = zoomMinRatio;
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "Zoom capability read failed: " + e.getMessage());
+        }
+
+        updateZoomUi();
+    }
+
+    private float progressToZoomRatio(int progress) {
+        if (!zoomSupported || ZOOM_SEEKBAR_MAX <= 0) return 1.0f;
+        float t = Math.max(0f, Math.min(1f, progress / (float) ZOOM_SEEKBAR_MAX));
+        return zoomMinRatio + (zoomMaxRatio - zoomMinRatio) * t;
+    }
+
+    private int zoomRatioToProgress(float zoomRatio) {
+        if (!zoomSupported || zoomMaxRatio <= zoomMinRatio) return 0;
+        float t = (zoomRatio - zoomMinRatio) / (zoomMaxRatio - zoomMinRatio);
+        t = Math.max(0f, Math.min(1f, t));
+        return Math.round(t * ZOOM_SEEKBAR_MAX);
+    }
+
+    private void requestZoomApply(boolean immediate) {
+        if (!zoomSupported || previewSession == null || cameraDevice == null || capturing) return;
+        long now = System.currentTimeMillis();
+        if (immediate || now - lastZoomApplyMs >= ZOOM_APPLY_MIN_INTERVAL_MS) {
+            lastZoomApplyMs = now;
+            applyPreviewRepeatingRequest();
+            return;
+        }
+        long delay = ZOOM_APPLY_MIN_INTERVAL_MS - (now - lastZoomApplyMs);
+        mainHandler.removeCallbacks(zoomApplyRunnable);
+        mainHandler.postDelayed(zoomApplyRunnable, Math.max(1L, delay));
+    }
+
+    private final Runnable zoomApplyRunnable = () -> {
+        if (!zoomSupported || previewSession == null || cameraDevice == null || capturing) return;
+        lastZoomApplyMs = System.currentTimeMillis();
+        applyPreviewRepeatingRequest();
+    };
+
+    private void updateZoomUi() {
+        mainHandler.post(() -> {
+            if (tvZoom != null) {
+                if (!zoomSupported) {
+                    tvZoom.setText("ZOOM N/A");
+                    tvZoom.setAlpha(0.55f);
+                } else {
+                    tvZoom.setText(String.format(Locale.US, "ZOOM %.1fx", currentZoomRatio));
+                    tvZoom.setAlpha(1f);
+                }
+            }
+            if (seekZoom != null) {
+                seekZoom.setEnabled(zoomSupported);
+                seekZoom.setMax(ZOOM_SEEKBAR_MAX);
+                int p = zoomRatioToProgress(currentZoomRatio);
+                if (seekZoom.getProgress() != p) seekZoom.setProgress(p);
+                seekZoom.setAlpha(zoomSupported ? 1f : 0.5f);
+            }
+        });
+    }
+
     private CaptureRequest.Builder buildPreviewRequestBuilder(Surface previewSurface,
                                                               Integer afTrigger,
                                                               boolean preferTapFocus) throws CameraAccessException {
@@ -878,6 +1006,9 @@ public class MainActivity extends AppCompatActivity {
                         : CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE);
         b.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON);
         b.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, currentEv);
+        if (zoomSupported) {
+            b.set(CaptureRequest.CONTROL_ZOOM_RATIO, currentZoomRatio);
+        }
 
         if (holdFocusRegion) {
             Integer maxAfRegions = camChars != null ? camChars.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AF) : 0;
@@ -1267,6 +1398,9 @@ public class MainActivity extends AppCompatActivity {
             capBuilder.set(CaptureRequest.CONTROL_AF_MODE,
                 CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE);
             capBuilder.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, currentEv);
+            if (zoomSupported) {
+                capBuilder.set(CaptureRequest.CONTROL_ZOOM_RATIO, currentZoomRatio);
+            }
 
             // CRITICAL: Set JPEG_ORIENTATION to 0 — we do pixel rotation in software
             capBuilder.set(CaptureRequest.JPEG_ORIENTATION, 0);
@@ -1336,6 +1470,7 @@ public class MainActivity extends AppCompatActivity {
             receipt.append("JPEG pixel rotation: ").append(jpegRotDeg).append("\u00B0\n");
             receipt.append("JPEG_ORIENTATION sent: 0\u00B0 (pixel rotation in software)\n");
             receipt.append("EV: ").append((currentEv >= 0 ? "+" : "")).append(currentEv).append("\n");
+            receipt.append("Zoom: ").append(String.format(Locale.US, "%.1fx", currentZoomRatio)).append("\n");
 
             // Save JPEG
             if (jpegData[0] != null) {
